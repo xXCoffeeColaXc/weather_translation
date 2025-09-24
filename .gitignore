@@ -1,2 +1,5 @@
 data/*
 **/__pycache__/
+.venv/
+/eval/output
+/eval/predictions
