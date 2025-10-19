@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -33,9 +34,57 @@ GRAD_EPS = 1e-8
 USE_KL = False
 
 
+@dataclass
+class SamplerConfig:
+    prompt: str = PROMPT
+    negative_prompt: str = NEG
+    size: Tuple[int, int] = SIZE
+    steps: int = STEPS
+    strength: float = STRENGTH
+    cfg: float = CFG
+    guide_start: float = GUIDE_START
+    guide_end: float = GUIDE_END
+    eta: float = ETA
+    use_kl: bool = USE_KL
+    grad_eps: float = GRAD_EPS
+
+
+@dataclass
+class StepOutput:
+    step_index: int
+    timestep: int
+    progress: float
+    ce_loss: Optional[float]
+    decoded_image: torch.Tensor
+    predicted_mask: torch.Tensor
+
+
 def save_01(x01: torch.Tensor, path: Path) -> None:
     array = (x01[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     Image.fromarray(array).save(path)
+
+
+def decode_latents(
+    pipe: StableDiffusionImg2ImgPipeline,
+    latents: torch.Tensor,
+    *,
+    device_type: str,
+    torch_dtype: torch.dtype,
+) -> torch.Tensor:
+    with torch.no_grad():
+        with _maybe_autocast(device_type, torch_dtype):
+            decoded = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
+            return (decoded + 1) / 2
+
+
+def predict_mask_from_image(
+    image_batch: torch.Tensor,
+    bundle: ModelBundle,
+    *,
+    target_size: Tuple[int, int],
+) -> torch.Tensor:
+    logits = compute_teacher_logits(image_batch, bundle, target_size=target_size)
+    return logits.argmax(dim=1)
 
 
 def build_sampler_loader(
@@ -154,6 +203,135 @@ def kl_logits(
     return F.kl_div(log_probs, ref_probs, reduction="batchmean")
 
 
+def run_single_sample(
+    pipe: StableDiffusionImg2ImgPipeline,
+    teacher_bundle: ModelBundle,
+    *,
+    image_pil: Image.Image,
+    reference_image: torch.Tensor,
+    mask_batch: torch.Tensor,
+    text_context: torch.Tensor,
+    config: SamplerConfig,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    callback_interval: Optional[int] = None,
+    step_callback: Optional[Callable[[StepOutput], None]] = None,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, list[float]]:
+    if config.steps <= 0:
+        raise ValueError("config.steps must be positive")
+
+    if callback_interval is None:
+        callback_interval = max(1, config.steps // 10)
+    else:
+        callback_interval = max(1, callback_interval)
+
+    with torch.no_grad():
+        with _maybe_autocast(device.type, torch_dtype):
+            init = pipe.image_processor.preprocess(image_pil).to(device, dtype=torch_dtype)
+            init_latents = pipe.vae.encode(init * 2 - 1).latent_dist.sample() * pipe.vae.config.scaling_factor
+
+    pipe.scheduler.set_timesteps(config.steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+    total_timesteps = len(timesteps)
+    t_start_index = int((1.0 - config.strength) * total_timesteps)
+    t_start_index = max(0, min(total_timesteps - 1, t_start_index))
+    noise = torch.randn_like(init_latents)
+    timestep = timesteps[t_start_index]
+    if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
+        timestep = timestep.repeat(init_latents.shape[0])
+    latents = pipe.scheduler.add_noise(init_latents, noise, timestep).detach().requires_grad_(True)
+
+    reference_logits = None
+    if config.use_kl:
+        with torch.no_grad():
+            reference_logits = compute_teacher_logits(reference_image, teacher_bundle, target_size=mask_batch.shape[-2:])
+
+    ce_log: list[float] = []
+    steps_to_run = total_timesteps - t_start_index
+    denom = max(1, steps_to_run - 1)
+
+    for step_index, timestep in enumerate(timesteps[t_start_index:]):
+        latent_input = torch.cat([latents, latents], dim=0)
+        with _maybe_autocast(device.type, torch_dtype):
+            noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
+            noise_uncond, noise_text = noise_pred.chunk(2)
+            noise_pred = noise_uncond + config.cfg * (noise_text - noise_uncond)
+
+        with torch.no_grad():
+            latents_next = pipe.scheduler.step(noise_pred, timestep, latents.detach()).prev_sample
+
+        progress = step_index / denom
+        if verbose:
+            print(f"Step {step_index}/{denom} progress {progress:.3f}")
+
+        ce_loss_value: Optional[float] = None
+        if config.guide_start <= progress <= config.guide_end:
+            latents_guided = latents_next.clone().detach().requires_grad_(True)
+            with _maybe_autocast(device.type, torch_dtype):
+                decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample
+                decoded_01 = (decoded + 1) / 2
+
+            loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+            if config.use_kl and reference_logits is not None:
+                loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
+
+            grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
+            grad_norm = torch.linalg.norm(grad)
+            normalised_grad = grad / (grad_norm + config.grad_eps)
+            latents = (latents_next - config.eta * normalised_grad).detach().requires_grad_(True)
+            ce_loss_value = float(loss.detach().cpu())
+            ce_log.append(ce_loss_value)
+        else:
+            latents = latents_next.detach().requires_grad_(True)
+
+        should_log_step = (
+            step_callback is not None
+            and (step_index % callback_interval == 0 or step_index == steps_to_run - 1)
+        )
+        if should_log_step:
+            decoded_for_log = decode_latents(
+                pipe,
+                latents,
+                device_type=device.type,
+                torch_dtype=torch_dtype,
+            )
+            predicted_mask = predict_mask_from_image(
+                decoded_for_log,
+                teacher_bundle,
+                target_size=mask_batch.shape[-2:],
+            )
+            if isinstance(timestep, torch.Tensor):
+                timestep_value = int(timestep.detach().cpu().item())
+            else:
+                timestep_value = int(timestep)
+            step_callback(
+                StepOutput(
+                    step_index=step_index,
+                    timestep=timestep_value,
+                    progress=progress,
+                    ce_loss=ce_loss_value,
+                    decoded_image=decoded_for_log.detach().cpu(),
+                    predicted_mask=predicted_mask.detach().cpu(),
+                )
+            )
+
+        if verbose and (step_index % max(1, config.steps // 10) == 0):
+            if isinstance(timestep, torch.Tensor):
+                timestep_display = int(timestep.detach().cpu().item())
+            else:
+                timestep_display = int(timestep)
+            print(f"[{step_index:02d}/{steps_to_run}] t={timestep_display}")
+
+    decoded_final = decode_latents(
+        pipe,
+        latents,
+        device_type=device.type,
+        torch_dtype=torch_dtype,
+    )
+    return decoded_final, ce_log
+
+
 def _maybe_autocast(device_type: str, dtype: torch.dtype):
     return torch.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else contextlib.nullcontext()
 
@@ -167,9 +345,14 @@ def main(
     max_samples: Optional[int] = 2,
     num_workers: int = 0,
     seed: Optional[int] = None,
+    config: Optional[SamplerConfig] = None,
+    callback_interval: Optional[int] = None,
+    step_callback: Optional[Callable[[StepOutput], None]] = None,
+    verbose: bool = True,
 ) -> None:
     device = torch.device(DEVICE)
     torch_dtype = DTYPE if device.type == "cuda" else torch.float32
+    sampler_config = config or SamplerConfig()
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -200,21 +383,21 @@ def main(
     dataset, loader = build_sampler_loader(
         Path(dataset_root),
         split,
-        SIZE,
+        sampler_config.size,
         batch_size=1,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
     )
 
     prompt_tokens = pipe.tokenizer(
-        PROMPT,
+        sampler_config.prompt,
         padding="max_length",
         max_length=pipe.tokenizer.model_max_length,
         truncation=True,
         return_tensors="pt",
     )
     negative_tokens = pipe.tokenizer(
-        NEG or "",
+        sampler_config.negative_prompt or "",
         padding="max_length",
         max_length=pipe.tokenizer.model_max_length,
         truncation=True,
@@ -246,77 +429,26 @@ def main(
         # save_mask(mask_batch[0], mask_path)
         mask_to_color(mask_batch[0]).save(mask_path)
 
-        # encode
-        with torch.no_grad():
-            with _maybe_autocast(device.type, torch_dtype):
-                init = pipe.image_processor.preprocess(image_pil).to(device, dtype=torch_dtype)
-                init_latents = pipe.vae.encode(init * 2 - 1).latent_dist.sample() * pipe.vae.config.scaling_factor
-
-        pipe.scheduler.set_timesteps(STEPS, device=device)
-        timesteps = pipe.scheduler.timesteps
-        t_start_index = int((1.0 - STRENGTH) * len(timesteps))
-        t_start_index = max(0, min(len(timesteps) - 1, t_start_index))
-        noise = torch.randn_like(init_latents)
-        timestep = timesteps[t_start_index]
-        if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
-            timestep = timestep.repeat(init_latents.shape[0])
-        latents = pipe.scheduler.add_noise(init_latents, noise, timestep).detach().requires_grad_(True)
-
-        reference_logits = None
-        if USE_KL:
-            with torch.no_grad():
-                reference_logits = compute_teacher_logits(image_batch,
-                                                          teacher_bundle,
-                                                          target_size=mask_batch.shape[-2:])
-
-        ce_log: list[float] = []
-        denom = max(1, len(timesteps) - t_start_index - 1)
-
-        for step_index, timestep in enumerate(timesteps[t_start_index:]):
-            latent_input = torch.cat([latents, latents], dim=0)
-            with _maybe_autocast(device.type, torch_dtype):
-                noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
-                noise_uncond, noise_text = noise_pred.chunk(2)
-                noise_pred = noise_uncond + CFG * (noise_text - noise_uncond)
-
-            # scheduler step (no grad)
-            with torch.no_grad():
-                latents_next = pipe.scheduler.step(noise_pred, timestep, latents.detach()).prev_sample
-
-            # ---- SGG mid-window
-            progress = step_index / denom
-            print(f"Step {step_index}/{denom} progress {progress:.3f}")
-            if GUIDE_START <= progress <= GUIDE_END:
-                latents_guided = latents_next.clone().detach().requires_grad_(True)
-                with _maybe_autocast(device.type, torch_dtype):
-                    decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample
-                    decoded_01 = (decoded + 1) / 2
-
-                loss = ce_label(decoded_01, mask_batch, teacher_bundle)
-                if USE_KL and reference_logits is not None:
-                    loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
-
-                grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
-                grad_norm = torch.linalg.norm(grad)
-                normalised_grad = grad / (grad_norm + GRAD_EPS)
-                latents = (latents_next - ETA * normalised_grad).detach().requires_grad_(True)
-                ce_log.append(float(loss.detach().cpu()))
-            else:
-                latents = latents_next.detach().requires_grad_(True)
-
-            if (step_index % max(1, STEPS // 10) == 0):
-                print(f"[{step_index:02d}/{len(timesteps)-t_start_index}] t={int(timestep)}")
-
-        # decode final
-        with torch.no_grad():
-            with _maybe_autocast(device.type, torch_dtype):
-                decoded = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
-                decoded_01 = (decoded + 1) / 2
+        decoded_01, ce_log = run_single_sample(
+            pipe,
+            teacher_bundle,
+            image_pil=image_pil,
+            reference_image=image_batch,
+            mask_batch=mask_batch,
+            text_context=text_context,
+            config=sampler_config,
+            device=device,
+            torch_dtype=torch_dtype,
+            callback_interval=callback_interval,
+            step_callback=step_callback,
+            verbose=verbose,
+        )
 
         save_01(decoded_01, output_path)
         ce_path = output_path.with_name(output_path.stem + "_ce.npy")
         np.save(ce_path, np.array(ce_log, dtype=np.float32))
-        print(f"saved {relative_path} steps_with_CE: {len(ce_log)}")
+        if verbose:
+            print(f"saved {relative_path} steps_with_CE: {len(ce_log)}")
 
 
 if __name__ == "__main__":
