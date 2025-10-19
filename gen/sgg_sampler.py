@@ -8,27 +8,27 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline
+from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
 from torch.cuda.amp import autocast as cuda_autocast
 
 from seg.dataloaders.cityscapes import CityscapesSegmentation, IGNORE_LABEL
 from seg.infer import ModelBundle, build_cityscapes_dataloader, load_hf_model
-from seg.utils.hf_utils import build_joint_resize, tensor_to_pil
+from seg.utils.hf_utils import build_joint_resize, tensor_to_pil, mask_to_color
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16
 MODEL = "runwayml/stable-diffusion-v1-5"
-TEACHER_MODEL = "segformer_b5"
+TEACHER_MODEL = "segformer_b0"  # "segformer_b5"
 
-PROMPT = "autonomous driving city street at night, wet asphalt, headlights"
-NEG = "blurry, distorted, warped geometry"
-SIZE = (384 // 2, 768 // 2)
-STEPS = 750
+PROMPT = "nighttime urban street, realistic car headlights and taillights, wet asphalt reflections, street lamps glowing warm amber, detailed building facades, cinematic contrast, foggy atmosphere, volumetric light beams"
+NEG = "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
+SIZE = (384, 768)
+STEPS = 26
 STRENGTH = 0.55
-CFG = 4.0
+CFG = 5.5
 
-GUIDE_START, GUIDE_END = 1.0, 1.8
-ETA = 0.4
+GUIDE_START, GUIDE_END = 0.45, 0.9
+ETA = 0.8
 GRAD_EPS = 1e-8
 USE_KL = False
 
@@ -115,6 +115,7 @@ def compute_teacher_logits(
     target_size: Tuple[int, int],
 ) -> torch.Tensor:
     device = bundle.device
+    #with torch.autocast(device_type=device.type, dtype=bundle.model.dtype):
     with _no_autocast(device.type):
         pixel_values = _prepare_teacher_inputs(image_batch.to(device=device), bundle.processor, target_size)
         pixel_values = pixel_values.to(device=device, dtype=bundle.model.dtype)
@@ -160,10 +161,10 @@ def _maybe_autocast(device_type: str, dtype: torch.dtype):
 def main(
     dataset_root: str | Path = "data/cityscapes",
     split: str = "val",
-    out_dir: str | Path = "out/sgg",
+    out_dir: str | Path = "eval/sgg",
     *,
     teacher_model: str = TEACHER_MODEL,
-    max_samples: Optional[int] = 16,
+    max_samples: Optional[int] = 2,
     num_workers: int = 0,
     seed: Optional[int] = None,
 ) -> None:
@@ -176,7 +177,7 @@ def main(
     output_root = Path(out_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    teacher_bundle = load_hf_model(teacher_model, device=str(device))
+    teacher_bundle = load_hf_model(teacher_model, device=str(device), torch_dtype=torch_dtype)
 
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL, torch_dtype=torch_dtype, safety_checker=None)
     try:
@@ -184,8 +185,13 @@ def main(
     except Exception as exc:  # pragma: no cover - optional accel
         print(f"Could not enable xformers attention: {exc}")
 
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.enable_attention_slicing()
+    #pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_attention_slicing()  # chunk attention to reduce peak memory
+    pipe.enable_vae_slicing()  # decode in slices to save VRAM
+    pipe.enable_vae_tiling()  # tile VAE for large images
+    pipe.unet.to(memory_format=torch.channels_last)
+
     pipe = pipe.to(device)
     pipe.unet.eval()
     pipe.vae.eval()
@@ -234,17 +240,27 @@ def main(
         mask_batch = masks.to(device=device, dtype=torch.long)
         image_pil = tensor_to_pil(images[0])
 
+        original_path = output_path.with_name(output_path.stem + "_original.png")
+        mask_path = output_path.with_name(output_path.stem + "_mask.png")
+        image_pil.save(original_path)
+        # save_mask(mask_batch[0], mask_path)
+        mask_to_color(mask_batch[0]).save(mask_path)
+
         # encode
         with torch.no_grad():
             with _maybe_autocast(device.type, torch_dtype):
                 init = pipe.image_processor.preprocess(image_pil).to(device, dtype=torch_dtype)
-                latents = pipe.vae.encode(init * 2 - 1).latent_dist.sample() * pipe.vae.config.scaling_factor
+                init_latents = pipe.vae.encode(init * 2 - 1).latent_dist.sample() * pipe.vae.config.scaling_factor
 
         pipe.scheduler.set_timesteps(STEPS, device=device)
         timesteps = pipe.scheduler.timesteps
-        t_start = int((1 - STRENGTH) * len(timesteps))
-        noise = torch.randn_like(latents)
-        latents = pipe.scheduler.add_noise(latents, noise, timesteps[t_start]).detach().requires_grad_(True)
+        t_start_index = int((1.0 - STRENGTH) * len(timesteps))
+        t_start_index = max(0, min(len(timesteps) - 1, t_start_index))
+        noise = torch.randn_like(init_latents)
+        timestep = timesteps[t_start_index]
+        if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
+            timestep = timestep.repeat(init_latents.shape[0])
+        latents = pipe.scheduler.add_noise(init_latents, noise, timestep).detach().requires_grad_(True)
 
         reference_logits = None
         if USE_KL:
@@ -254,9 +270,9 @@ def main(
                                                           target_size=mask_batch.shape[-2:])
 
         ce_log: list[float] = []
-        denom = max(1, len(timesteps) - t_start - 1)
+        denom = max(1, len(timesteps) - t_start_index - 1)
 
-        for step_index, timestep in enumerate(timesteps[t_start:]):
+        for step_index, timestep in enumerate(timesteps[t_start_index:]):
             latent_input = torch.cat([latents, latents], dim=0)
             with _maybe_autocast(device.type, torch_dtype):
                 noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
@@ -269,23 +285,27 @@ def main(
 
             # ---- SGG mid-window
             progress = step_index / denom
-            # if GUIDE_START <= progress <= GUIDE_END:
-            #     latents_guided = latents_next.clone().detach().requires_grad_(True)
-            #     with _maybe_autocast(device.type, torch_dtype):
-            #         decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample
-            #         decoded_01 = (decoded + 1) / 2
+            print(f"Step {step_index}/{denom} progress {progress:.3f}")
+            if GUIDE_START <= progress <= GUIDE_END:
+                latents_guided = latents_next.clone().detach().requires_grad_(True)
+                with _maybe_autocast(device.type, torch_dtype):
+                    decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample
+                    decoded_01 = (decoded + 1) / 2
 
-            #     loss = ce_label(decoded_01, mask_batch, teacher_bundle)
-            #     if USE_KL and reference_logits is not None:
-            #         loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
+                loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+                if USE_KL and reference_logits is not None:
+                    loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
 
-            #     grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
-            #     grad_norm = torch.linalg.norm(grad)
-            #     normalised_grad = grad / (grad_norm + GRAD_EPS)
-            #     latents = (latents_next - ETA * normalised_grad).detach().requires_grad_(True)
-            #     ce_log.append(float(loss.detach().cpu()))
-            # else:
-            latents = latents_next.detach().requires_grad_(True)
+                grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
+                grad_norm = torch.linalg.norm(grad)
+                normalised_grad = grad / (grad_norm + GRAD_EPS)
+                latents = (latents_next - ETA * normalised_grad).detach().requires_grad_(True)
+                ce_log.append(float(loss.detach().cpu()))
+            else:
+                latents = latents_next.detach().requires_grad_(True)
+
+            if (step_index % max(1, STEPS // 10) == 0):
+                print(f"[{step_index:02d}/{len(timesteps)-t_start_index}] t={int(timestep)}")
 
         # decode final
         with torch.no_grad():

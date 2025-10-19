@@ -1,8 +1,13 @@
-# sd15_img2img_manual.py
-# Usage example:
-#   python sd15_img2img_manual.py \
-#     --image input.jpg --prompt "night rainy city street, wet asphalt, headlights" \
-#     --out out.png --width 768 --height 432 --steps 30 --strength 0.55 --cfg 7.5
+"""
+Usage example:
+  python gen/sd15_img2img_manual.py \
+    --image /home/talmacsi/BME/weather_translation/data/cityscapes/leftImg8bit/test/berlin/berlin_000000_000019_leftImg8bit.png \
+    --prompt "nighttime urban street, realistic car headlights and taillights, wet asphalt reflections, street lamps glowing warm amber, detailed building facades, cinematic contrast, foggy atmosphere, volumetric light beams" \
+    --negative-prompt "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights" \
+    --out gen/output/40_0-4_7-5.png --width 768 --height 432 --steps 40 --strength 0.4 --cfg 7.5 --scheduler dpm \
+    --fp16 --enable-attn-slicing --enable-vae-slicing --enable-vae-tiling --channels-last --enable-xformers \
+    --seed 42 --verbose
+"""
 
 import argparse, os, math, numpy as np
 from PIL import Image
@@ -122,7 +127,10 @@ def run(args):
 
     gen = seed_everything(args.seed)
     noise = torch.randn_like(init_latents)
-    latents = pipe.scheduler.add_noise(init_latents, noise, timesteps[t_start_index])
+    timestep = timesteps[t_start_index]
+    if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
+        timestep = timestep.repeat(init_latents.shape[0])
+    latents = pipe.scheduler.add_noise(init_latents, noise, timestep)
 
     # 6) Manual denoising loop (x_{t} -> x_{t-1})
     #    - At each step: UNet predicts noise -> scheduler does an update -> new latents

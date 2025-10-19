@@ -3,3 +3,7 @@ data/*
 .venv/
 /eval/output
 /eval/predictions
+/eval/sgg
+/gen/output
+/gen/sd15_img2img_manual.py.from-bkp-20251019
+/gen/sgg_sampler.py.from-bkp-20251019
