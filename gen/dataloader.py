@@ -149,12 +149,19 @@ def build_training_transform(image_size: int) -> transforms.Compose:
     """Default augmentation pipeline for model training."""
 
     return transforms.Compose([
-        transforms.Resize(
-            image_size,
-            transforms.InterpolationMode.BILINEAR,
+        # transforms.Resize(
+        #     image_size,
+        #     transforms.InterpolationMode.BILINEAR,
+        # ),
+        transforms.RandomResizedCrop(
+            size=image_size,
+            scale=(0.8, 1.0),  # small zoom-in/outs
+            ratio=(0.95, 1.05),  # keep near square to avoid distortions
+            interpolation=transforms.InterpolationMode.BICUBIC,
+            antialias=True,
         ),
         transforms.RandomCrop(image_size),
-        transforms.RandomHorizontalFlip(),
+        # transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Lambda(lambda tensor: tensor * 2.0 - 1.0),
     ])
