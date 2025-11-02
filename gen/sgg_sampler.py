@@ -1,4 +1,8 @@
 from __future__ import annotations
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import contextlib
 from pathlib import Path
@@ -19,19 +23,22 @@ from seg.utils.hf_utils import build_joint_resize, tensor_to_pil, mask_to_color
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16
 MODEL = "runwayml/stable-diffusion-v1-5"
+#MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "segformer_b0"  # "segformer_b5"
 
 PROMPT = "nighttime urban street, realistic car headlights and taillights, wet asphalt reflections, street lamps glowing warm amber, detailed building facades, cinematic contrast, foggy atmosphere, volumetric light beams"
 NEG = "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
-SIZE = (384, 768)
-STEPS = 26
-STRENGTH = 0.55
+SIZE = (512, 768)
+STEPS = 50
+STRENGTH = 0.6
 CFG = 3
 
 GUIDE_START, GUIDE_END = 0.2, 1.0
 ETA = 0.2
 GRAD_EPS = 1e-8
 USE_KL = False
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 
 @dataclass
@@ -367,16 +374,19 @@ def main(
     output_root = Path(out_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    teacher_bundle = load_hf_model(teacher_model, device=str(device), torch_dtype=torch_dtype)
+    teacher_bundle = load_hf_model(teacher_model, device=str(device))
 
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL, torch_dtype=torch_dtype, safety_checker=None)
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL,
+                                                          torch_dtype=torch_dtype,
+                                                          safety_checker=None,
+                                                          use_auth_token=HF_TOKEN)
     try:
         pipe.enable_xformers_memory_efficient_attention()
     except Exception as exc:  # pragma: no cover - optional accel
         print(f"Could not enable xformers attention: {exc}")
 
-    #pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    #pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.enable_attention_slicing()  # chunk attention to reduce peak memory
     pipe.enable_vae_slicing()  # decode in slices to save VRAM
     pipe.enable_vae_tiling()  # tile VAE for large images

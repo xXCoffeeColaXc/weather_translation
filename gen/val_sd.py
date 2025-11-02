@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator, List, Sequence
 
 import torch
-from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionModel, StableDiffusion3Pipeline
 from transformers import CLIPTextModel, CLIPTokenizer
 
 LOGGER = logging.getLogger(__name__)
@@ -172,11 +172,19 @@ def _load_component_if_exists(
 def load_finetuned_pipeline(args: argparse.Namespace, device: torch.device) -> StableDiffusionPipeline:
     dtype = _select_dtype(device, args.dtype)
     LOGGER.info("Loading base pipeline %s with dtype=%s on %s", args.pretrained_model_name_or_path, dtype, device)
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        torch_dtype=dtype,
-        safety_checker=None,
-    )
+
+    if args.pretrained_model_name_or_path == "stabilityai/stable-diffusion-3.5-medium":
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            torch_dtype=dtype,
+            safety_checker=None,
+        )
+    else:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            torch_dtype=dtype,
+            safety_checker=None,
+        )
     pipe.safety_checker = None
     pipe.requires_safety_checker = False
 

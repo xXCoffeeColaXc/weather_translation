@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import contextlib
 import argparse
 import json
 import logging
@@ -265,7 +265,7 @@ def prepare_models(
 
     if args.use_lora:
         try:
-            from diffusers import LoraConfig
+            from peft import LoraConfig
         except ImportError as exc:  # pragma: no cover - environment without LoRA support
             raise RuntimeError(
                 "LoRA fine-tuning requires diffusers>=0.21.0. Upgrade diffusers or omit --use-lora.") from exc
@@ -368,16 +368,22 @@ def maybe_sample_validation(
     sample_dir = args.output_dir / "validation" / f"step-{step:06d}"
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, prompt in enumerate(args.validation_prompts):
-        for copy in range(args.validation_num_images):
-            image = pipeline(
-                prompt=prompt,
-                num_inference_steps=args.sample_num_inference_steps,
-                guidance_scale=args.sample_guidance_scale,
-                generator=generator,
-            ).images[0]
-            out_path = sample_dir / f"{idx:02d}-{copy:02d}.png"
-            image.save(out_path)
+    dtype = torch.bfloat16 if accelerator.mixed_precision == "bf16" else (
+        torch.float16 if accelerator.mixed_precision == "fp16" else torch.float32)
+
+    with torch.inference_mode():
+        autocast_ctx = torch.autocast("cuda", dtype=dtype) if dtype != torch.float32 else contextlib.nullcontext()
+        with autocast_ctx:
+            for idx, prompt in enumerate(args.validation_prompts):
+                for copy in range(args.validation_num_images):
+                    image = pipeline(
+                        prompt=prompt,
+                        num_inference_steps=args.sample_num_inference_steps,
+                        guidance_scale=args.sample_guidance_scale,
+                        generator=generator,
+                    ).images[0]
+                    out_path = sample_dir / f"{idx:02d}-{copy:02d}.png"
+                    image.save(out_path)
 
     # Restore original train/eval states
     if unet_was_training:
