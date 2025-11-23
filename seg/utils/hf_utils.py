@@ -9,9 +9,9 @@ from PIL import Image
 
 from seg.dataloaders.labels import labels as CITYSCAPES_LABELS
 
-
 MODEL_ZOO: Dict[str, str] = {
     "segformer_b0": "nvidia/segformer-b0-finetuned-cityscapes-1024-1024",
+    "segformer_b1": "nvidia/segformer-b1-finetuned-cityscapes-1024-1024",
     "segformer_b2": "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
     "segformer_b5": "nvidia/segformer-b5-finetuned-cityscapes-1024-1024",
 }

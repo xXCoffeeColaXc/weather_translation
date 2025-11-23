@@ -153,15 +153,16 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["train"],
+        default=["train", "val", "test"],
         help="Dataset splits to consider (e.g. train val).",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("gen/checkpoints/sd_finetune"),
+        default=Path("gen/checkpoints/sd_lora_finetune_50ep_lora32"),
         help="Where to write checkpoints and logs.",
     )
+    # TODO: add exo objects, vehicles, bicycle, pedestrians flags
     parser.add_argument(
         "--prompt-template",
         type=str,
@@ -175,17 +176,17 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
         help="Optional overrides in the form condition=prompt text.",
     )
     parser.add_argument("--train-batch-size", type=int, default=2, help="Per device batch size.")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--num-epochs", type=int, default=1, help="Number of passes through the dataset.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--num-epochs", type=int, default=50, help="Number of passes through the dataset.")
     parser.add_argument("--max-train-steps", type=int, default=None, help="Total optimisation steps. Overrides epochs.")
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=SUPPORTED_SCHEDULERS)
     parser.add_argument("--lr-warmup-steps", type=int, default=500)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-eps", type=float, default=1e-8)
-    parser.add_argument("--mixed-precision", type=str, default="fp16", choices=("no", "fp16", "bf16"))
+    parser.add_argument("--mixed-precision", type=str, default="bf16", choices=("no", "fp16", "bf16"))
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -194,8 +195,9 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
-    parser.add_argument("--checkpointing-steps", type=int, default=500, help="Checkpoint frequency in global steps.")
+    parser.add_argument("--checkpointing-steps", type=int, default=1000, help="Checkpoint frequency in global steps.")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to an accelerator state directory.")
+
     parser.add_argument(
         "--validation-prompts",
         nargs="*",
@@ -210,6 +212,8 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sample-num-inference-steps", type=int, default=30)
     parser.add_argument("--sample-guidance-scale", type=float, default=7.5)
     parser.add_argument("--report-to", nargs="*", default=[], help="Optional accelerate trackers, e.g. tensorboard.")
+    parser.add_argument("--wandb-project", type=str, default="weather-converter-sd1.5", help="W&B project name.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Optional W&B run name.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,12 +301,21 @@ def prepare_models(
         weight_decay=args.adam_weight_decay,
     )
 
-    warmup_steps = int(0.05 * args.max_train_steps)
+    # Calculate warmup steps based on training setup
+    if args.max_train_steps is None:
+        # Calculate max_train_steps from epochs, dataset size, and batch configuration
+        train_dataloader_temp = build_dataloader(args)
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader_temp) / args.gradient_accumulation_steps)
+        max_train_steps = args.num_epochs * num_update_steps_per_epoch
+        warmup_steps = int(0.05 * max_train_steps)
+    else:
+        max_train_steps = args.max_train_steps
+        warmup_steps = int(0.05 * args.max_train_steps)
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,  # or args.lr_warmup_steps,
-        num_training_steps=args.max_train_steps,
+        num_training_steps=max_train_steps,
     )
 
     try:
@@ -484,7 +497,10 @@ def train(args: argparse.Namespace) -> None:
         args.max_train_steps = args.num_epochs * num_update_steps_per_epoch
 
     accelerator.init_trackers("sd-finetune", config=vars(args))
-
+    if "wandb" in args.report_to and args.wandb_run_name:
+        import wandb
+        wandb.run.name = args.wandb_run_name
+        wandb.run.save()
     (
         vae,
         text_encoder,

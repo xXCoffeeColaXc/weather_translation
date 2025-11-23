@@ -11,3 +11,5 @@ data/*
 /gen/sd15_img2img_manual.py.from-bkp-20251019
 /gen/sgg_sampler.py.from-bkp-20251019
 /eval/sgg_experiments
+/wandb
+/eval

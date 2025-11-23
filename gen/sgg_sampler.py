@@ -16,6 +16,11 @@ from PIL import Image
 from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
 from torch.cuda.amp import autocast as cuda_autocast
 
+from transformers import CLIPTextModel, CLIPTokenizer
+from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionModel, StableDiffusion3Pipeline
+
+from val_sd import _select_dtype, _load_component_if_exists
+
 from seg.dataloaders.cityscapes import CityscapesSegmentation, IGNORE_LABEL
 from seg.infer import ModelBundle, build_cityscapes_dataloader, load_hf_model
 from seg.utils.hf_utils import build_joint_resize, tensor_to_pil, mask_to_color
@@ -24,17 +29,17 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16
 MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
-TEACHER_MODEL = "segformer_b0"  # "segformer_b5"
+TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 
-PROMPT = "nighttime urban street, realistic car headlights and taillights, wet asphalt reflections, street lamps glowing warm amber, detailed building facades, cinematic contrast, foggy atmosphere, volumetric light beams"
+PROMPT = "light fog over city streets, subtle atmospheric haze, soft diffused headlights, gentle muted colors, slight low contrast, realistic foggy ambience"
 NEG = "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
-SIZE = (512, 768)
-STEPS = 50
-STRENGTH = 0.6
-CFG = 3
+SIZE = (512, 512)
+STEPS = 32
+STRENGTH = 0.6  # 600/1000 step of denoising
+CFG = 7.5
 
-GUIDE_START, GUIDE_END = 0.2, 1.0
-ETA = 0.2
+GUIDE_START, GUIDE_END = 1.2, 1.1
+ETA = 0.0
 GRAD_EPS = 1e-8
 USE_KL = False
 
@@ -221,7 +226,7 @@ def run_single_sample(
     config: SamplerConfig,  # steps, strength, cfg, guide window, etc.
     device: torch.device,
     torch_dtype: torch.dtype,
-    callback_interval: Optional[int] = None,
+    callback_interval: Optional[int] = 100,
     step_callback: Optional[Callable[[StepOutput], None]] = None,
     verbose: bool = True,
 ) -> tuple[torch.Tensor, list[float]]:
@@ -316,6 +321,7 @@ def run_single_sample(
             ce_log.append(ce_loss_value)
         else:
             # No guidance at this step: just continue the reverse trajectory.
+            print(" No SGG guidance at this step.")
             latents = latents_next.detach().requires_grad_(True)
 
         # (Optional) logging every few steps: decode preview + teacher prediction
@@ -350,15 +356,74 @@ def _maybe_autocast(device_type: str, dtype: torch.dtype):
     return torch.autocast(device_type=device_type, dtype=dtype) if device_type == "cuda" else contextlib.nullcontext()
 
 
+def load_finetuned_pipeline(device: torch.device, dtype: torch.dtype) -> StableDiffusionPipeline:
+    pretrained_model_name_or_path = "runwayml/stable-diffusion-v1-5"
+    progress = False
+
+    print("Loading base pipeline %s with dtype=%s on %s", pretrained_model_name_or_path, dtype, device)
+
+    pipe = StableDiffusionPipeline.from_pretrained(
+        pretrained_model_name_or_path,
+        torch_dtype=dtype,
+        safety_checker=None,
+    )
+    pipe.safety_checker = None
+    pipe.requires_safety_checker = False
+
+    ckpt_dir = Path("gen/checkpoints/sd_lora_finetune_50ep_lora32/final").expanduser().resolve()
+
+    text_encoder = _load_component_if_exists(CLIPTextModel, ckpt_dir / "text_encoder", dtype=dtype)
+    if text_encoder is not None:
+        pipe.text_encoder = text_encoder
+
+    tokenizer = _load_component_if_exists(CLIPTokenizer, ckpt_dir / "tokenizer", dtype=None)
+    if tokenizer is not None:
+        pipe.tokenizer = tokenizer
+
+    vae = _load_component_if_exists(AutoencoderKL, ckpt_dir / "vae", dtype=dtype)
+    if vae is not None:
+        pipe.vae = vae
+
+    unet_path = ckpt_dir / "unet"
+    lora_path = ckpt_dir / "unet_lora"
+
+    if unet_path.exists():
+        print("Loading fine-tuned UNet from %s", unet_path)
+        pipe.unet = UNet2DConditionModel.from_pretrained(unet_path, torch_dtype=dtype)
+    elif lora_path.exists():
+        print("Loading LoRA weights from %s", lora_path)
+        try:
+            #pipe.load_lora_weights(lora_path)
+            pipe.unet.load_attn_procs(lora_path)
+            # Optional: verify by checking keys (class-name checks are brittle)
+            has_lora = any("lora" in k.lower() for k in pipe.unet.state_dict().keys())
+            print("LoRA params present in UNet state: %s", has_lora)
+
+        except AttributeError as exc:
+            raise RuntimeError("The installed diffusers version does not support `load_lora_weights`. "
+                               "Upgrade diffusers or load a checkpoint with full UNet weights.") from exc
+    else:
+        print("No UNet or LoRA weights found in %s; using base checkpoint UNet.", ckpt_dir)
+
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception as exc:  # pragma: no cover - optional accel
+        print("Could not enable xformers attention: %s", exc)
+
+    pipe.to(device)
+    pipe.set_progress_bar_config(disable=not progress)
+    return pipe
+
+
 def main(
     dataset_root: str | Path = "data/cityscapes",
     split: str = "val",
-    out_dir: str | Path = "eval/sgg",
+    out_dir: str | Path = "eval/sgg_raw_guided_gsg_30strength",
     *,
     teacher_model: str = TEACHER_MODEL,
-    max_samples: Optional[int] = 2,
-    num_workers: int = 0,
-    seed: Optional[int] = None,
+    max_samples: Optional[int] = 4,
+    num_workers: int = 8,
+    seed: Optional[int] = 42,
     config: Optional[SamplerConfig] = None,
     callback_interval: Optional[int] = None,
     step_callback: Optional[Callable[[StepOutput], None]] = None,
@@ -376,10 +441,13 @@ def main(
 
     teacher_bundle = load_hf_model(teacher_model, device=str(device))
 
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL,
-                                                          torch_dtype=torch_dtype,
-                                                          safety_checker=None,
-                                                          use_auth_token=HF_TOKEN)
+    # pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL,
+    #                                                       torch_dtype=torch_dtype,
+    #                                                       safety_checker=None,
+    #                                                       use_auth_token=HF_TOKEN)
+
+    pipe = load_finetuned_pipeline(device, dtype=torch_dtype)
+
     try:
         pipe.enable_xformers_memory_efficient_attention()
     except Exception as exc:  # pragma: no cover - optional accel
@@ -430,6 +498,9 @@ def main(
     for idx, (images, masks) in enumerate(loader):
         if idx >= total_steps:
             break
+
+        if idx != 3:
+            continue
 
         sample_info = dataset.samples[idx]
         relative_path = sample_info.image_path.relative_to(dataset.left_dir)

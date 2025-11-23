@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--height", type=int, default=384)  # 512
     parser.add_argument("--width", type=int, default=720)  # 512
-    parser.add_argument("--num-inference-steps", type=int, default=50)
-    parser.add_argument("--guidance-scale", type=float, default=3.0)
+    parser.add_argument("--num-inference-steps", type=int, default=30)
+    parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument(
         "--negative-prompt",
         type=str,
@@ -211,17 +211,22 @@ def load_finetuned_pipeline(args: argparse.Namespace, device: torch.device) -> S
     elif lora_path.exists():
         LOGGER.info("Loading LoRA weights from %s", lora_path)
         try:
-            pipe.load_lora_weights(lora_path)
+            #pipe.load_lora_weights(lora_path)
+            pipe.unet.load_attn_procs(lora_path)
+            # Optional: verify by checking keys (class-name checks are brittle)
+            has_lora = any("lora" in k.lower() for k in pipe.unet.state_dict().keys())
+            LOGGER.info("LoRA params present in UNet state: %s", has_lora)
+
         except AttributeError as exc:
             raise RuntimeError("The installed diffusers version does not support `load_lora_weights`. "
                                "Upgrade diffusers or load a checkpoint with full UNet weights.") from exc
 
-        if args.fuse_lora:
-            LOGGER.info("Fusing LoRA weights into UNet")
-            try:
-                pipe.fuse_lora()
-            except AttributeError:
-                LOGGER.warning("Diffusers version does not provide `fuse_lora`; proceeding without fusing.")
+        # if args.fuse_lora:
+        #     LOGGER.info("Fusing LoRA weights into UNet")
+        #     try:
+        #         pipe.fuse_lora()
+        #     except AttributeError:
+        #         LOGGER.warning("Diffusers version does not provide `fuse_lora`; proceeding without fusing.")
     else:
         LOGGER.warning("No UNet or LoRA weights found in %s; using base checkpoint UNet.", ckpt_dir)
 
