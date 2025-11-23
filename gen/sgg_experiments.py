@@ -216,8 +216,10 @@ def create_step_callback(
     def _callback(step: StepOutput) -> None:
         suffix = f"step_{step.step_index:03d}_t{step.timestep:04d}"
         decoded_path = steps_dir / f"{suffix}_decoded.png"
+        decoded_x0_path = steps_dir / f"{suffix}_x0.png"
         mask_path = steps_dir / f"{suffix}_mask.png"
         save_01(step.decoded_image, decoded_path)
+        save_01(step.decoded_x0_image, decoded_x0_path)
         mask_image = mask_to_color(step.predicted_mask[0])
         mask_image.save(mask_path)
         state["last_mask"] = step.predicted_mask
