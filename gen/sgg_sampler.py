@@ -32,16 +32,17 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 
-CONDITION = "rain"
-PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
+# CONDITION = "rain"
+# PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
+PROMPT = "foggy morning city traffic, diffused lights, detailed, immersive atmosphere"
 NEG = "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
 SIZE = (512, 512)
-STEPS = 50
+STEPS = 100
 STRENGTH = 0.4  # 600/1000 step of denoising
 CFG = 7.5
 
-GUIDE_START, GUIDE_END = 0.0, 0.9
-ETA = 6.0
+GUIDE_START, GUIDE_END = 0.0, 1.0
+ETA = 8.0
 GRAD_EPS = 1e-8
 USE_KL = False
 
@@ -55,18 +56,18 @@ class SamplerConfig:
     size: Tuple[int, int] = SIZE
     steps: int = STEPS
     strength: float = STRENGTH
-    start_timestep_value: Optional[int] = 400  # e.g., 400 to start from that training timestep
-    full_denoise_from_start: bool = True  # if True, run a contiguous chain from start_timestep_value → 0
-    timestep_stride: int = 4  # stride for contiguous timesteps when full_denoise_from_start is True
+    start_timestep_value: Optional[int] = None  # e.g., 400 to start from that training timestep
+    full_denoise_from_start: bool = False  # if True, run a contiguous chain from start_timestep_value → 0
+    timestep_stride: int = 1  # stride for contiguous timesteps when full_denoise_from_start is True
     timestep_spacing: str = "trailing"  # scheduler spacing when not using the full contiguous path
-    use_karras_sigmas: bool = False  # DPM++ only; must be False for custom contiguous timesteps
+    use_karras_sigmas: bool = True  # DPM++ only; must be False for custom contiguous timesteps
     cfg: float = CFG
     guide_start: float = GUIDE_START
     guide_end: float = GUIDE_END
     eta: float = ETA
     use_kl: bool = USE_KL
     grad_eps: float = GRAD_EPS
-    swapping: bool = True  # unused here
+    use_cycle: bool = False  # whether to alternate GSG/LCG/skip cycles
 
 
 @dataclass
@@ -83,6 +84,147 @@ class StepOutput:
 def save_01(x01: torch.Tensor, path: Path) -> None:
     array = (x01[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     Image.fromarray(array).save(path)
+
+
+def _encode_init_latents(
+    pipe: StableDiffusionImg2ImgPipeline,
+    image_pil: Image.Image,
+    *,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+) -> torch.Tensor:
+    with torch.no_grad():
+        with _maybe_autocast(device.type, torch_dtype):
+            init = pipe.image_processor.preprocess(image_pil).to(device, dtype=torch_dtype)  # already in [-1,1]
+            return pipe.vae.encode(init).latent_dist.sample() * pipe.vae.config.scaling_factor
+
+
+def _build_timesteps(
+    scheduler,
+    config: SamplerConfig,
+    *,
+    device: torch.device,
+    verbose: bool,
+) -> tuple[torch.Tensor, int]:
+    """
+    Returns (timesteps, start_index). Handles contiguous mode or cropped scheduler spacing.
+    """
+    if config.full_denoise_from_start:
+        if config.start_timestep_value is None:
+            raise ValueError("full_denoise_from_start=True requires start_timestep_value to be set.")
+        if getattr(scheduler.config, "use_karras_sigmas", False):
+            raise ValueError("full_denoise_from_start=True requires scheduler.use_karras_sigmas=False.")
+        stride = max(1, int(config.timestep_stride))
+        start_t = int(min(config.start_timestep_value, scheduler.config.num_train_timesteps - 1))
+        custom_timesteps = torch.arange(start_t, -1, -stride, device=device, dtype=torch.int64)
+        scheduler.set_timesteps(timesteps=custom_timesteps.tolist(), device=device)
+        timesteps = scheduler.timesteps
+        t_start_index = 0
+        if verbose:
+            print(f"Using full contiguous timesteps from {start_t} → 0 with stride {stride} "
+                  f"({len(timesteps)} total steps).")
+        return timesteps, t_start_index
+
+    scheduler.set_timesteps(config.steps, device=device)
+    full_timesteps = scheduler.timesteps
+
+    if config.start_timestep_value is not None:
+        target = torch.tensor(config.start_timestep_value, device=full_timesteps.device, dtype=full_timesteps.dtype)
+        t_start_index = int(torch.argmin(torch.abs(full_timesteps - target)).item())
+    else:
+        total_timesteps = len(full_timesteps)
+        steps_to_use = max(1, int(total_timesteps * config.strength))
+        t_start_index = max(total_timesteps - steps_to_use, 0)
+
+    timesteps = full_timesteps[t_start_index:]
+
+    if verbose:
+        start_ts_value = float(timesteps[0].item()) if isinstance(timesteps[0], torch.Tensor) else float(timesteps[0])
+        print(f"Using {len(timesteps)}/{len(full_timesteps)} timesteps, start index {t_start_index}, "
+              f"start t={start_ts_value:.1f}")
+        print(f"Timesteps: {timesteps}")
+
+    return timesteps, t_start_index
+
+
+def _add_noise(
+    scheduler,
+    init_latents: torch.Tensor,
+    timestep: torch.Tensor,
+    *,
+    verbose: bool,
+) -> torch.Tensor:
+    if verbose:
+        print(f"Adding noise at timestep {timestep}.")
+    if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
+        timestep = timestep.repeat(init_latents.shape[0])
+    return scheduler.add_noise(init_latents, torch.randn_like(init_latents), timestep)
+
+
+def _scheduler_step_with_x0(
+    scheduler,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+    noise_pred: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        step_result = scheduler.step(noise_pred, timestep, latents.detach())
+    latents_next = step_result.prev_sample if hasattr(step_result, "prev_sample") else step_result[0]
+    pred_original_latents = getattr(step_result, "pred_original_sample", None)
+    if pred_original_latents is None:
+        alpha_prod_t = scheduler.alphas_cumprod[int(timestep)].to(device=latents.device, dtype=latents.dtype)
+        sqrt_alpha_t = torch.sqrt(alpha_prod_t)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_prod_t)
+        pred_original_latents = (latents.detach() - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
+    return latents_next, pred_original_latents.detach()
+
+
+def _maybe_apply_sgg(
+    latents_next: torch.Tensor,
+    timestep: torch.Tensor,
+    progress: float,
+    *,
+    pipe,
+    mask_batch: torch.Tensor,
+    teacher_bundle: ModelBundle,
+    reference_logits: Optional[torch.Tensor],
+    config: SamplerConfig,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    mode: str = "gsg",
+) -> tuple[torch.Tensor, Optional[float]]:
+    if not (config.guide_start <= progress <= config.guide_end):
+        print(" No SGG guidance at this step.")
+        return latents_next.detach().requires_grad_(True), None
+
+    alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
+    sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
+    eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
+
+    latents_guided = latents_next.clone().detach().requires_grad_(True)
+
+    with _maybe_autocast(device.type, torch_dtype):
+        decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        decoded_01 = (decoded + 1) / 2  # [0,1]
+
+    # Guidance branch selection
+    if mode == "lcg":
+        loss = _lcg_loss(decoded_01, mask_batch, teacher_bundle)
+        if loss is None:
+            print(" LCG skipped (no valid class pixels); falling back to GSG.")
+            loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+    else:
+        loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+
+    if config.use_kl and reference_logits is not None:
+        loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
+
+    grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
+    grad_norm = torch.linalg.norm(grad)
+    normalised_grad = grad / (grad_norm + config.grad_eps)
+
+    latents_updated = (latents_next - eta_t * normalised_grad).detach().requires_grad_(True)
+    return latents_updated, float(loss.detach().cpu())
 
 
 def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
@@ -239,6 +381,38 @@ def kl_logits(
     return F.kl_div(log_probs, ref_probs, reduction="batchmean")
 
 
+def _lcg_loss(
+    decoded_01: torch.Tensor,
+    mask_batch: torch.Tensor,
+    teacher_bundle: ModelBundle,
+) -> Optional[torch.Tensor]:
+    """
+    Label-conditional guidance: compute per-class NLL over each present class region, average across classes.
+    Returns None if no valid class pixels.
+    """
+    logits = compute_teacher_logits(decoded_01, teacher_bundle, target_size=mask_batch.shape[-2:])
+    log_probs = F.log_softmax(logits, dim=1)
+
+    classes = torch.unique(mask_batch)
+    classes = classes[classes != IGNORE_LABEL]
+    if classes.numel() == 0:
+        return None
+
+    per_class_losses = []
+    for cls in classes:
+        region_mask = (mask_batch == cls)
+        if not region_mask.any():
+            continue
+        # Only penalise pixels belonging to this class
+        nll = -log_probs[:, cls][region_mask]
+        per_class_losses.append(nll.mean())
+
+    if not per_class_losses:
+        return None
+
+    return torch.stack(per_class_losses).mean()
+
+
 def run_single_sample(
     pipe: StableDiffusionImg2ImgPipeline,  # SD-1.5 pipeline; we only use its submodules
     teacher_bundle: ModelBundle,  # frozen pixel classifier (SegFormer*)
@@ -254,60 +428,12 @@ def run_single_sample(
     step_callback: Optional[Callable[[StepOutput], None]] = None,
     verbose: bool = True,
 ) -> tuple[torch.Tensor, list[float]]:
-    # --- Encode the input image to latents (LD(M) step) -----------------------
-    # Use VAE encoder to map x0 ∈ [0,1] → z0 (latents), scaling by VAE factor.
-    with torch.no_grad():
-        with _maybe_autocast(device.type, torch_dtype):
-            init = pipe.image_processor.preprocess(image_pil).to(device, dtype=torch_dtype)
-            init_latents = pipe.vae.encode(init * 2 - 1).latent_dist.sample() * pipe.vae.config.scaling_factor
+    init_latents = _encode_init_latents(pipe, image_pil, device=device, torch_dtype=torch_dtype)
 
     # --- Build the reverse-time schedule and inject SDEdit noise --------------
-    # Two modes:
-    #  1) full_denoise_from_start=True: run a contiguous chain from start_timestep_value → 0 (optionally strided)
-    #  2) otherwise: use scheduler spacing and crop according to start_timestep_value or strength.
-    if config.full_denoise_from_start:
-        if config.start_timestep_value is None:
-            raise ValueError("full_denoise_from_start=True requires start_timestep_value to be set.")
-        if getattr(pipe.scheduler.config, "use_karras_sigmas", False):
-            raise ValueError("full_denoise_from_start=True requires scheduler.use_karras_sigmas=False.")
-        stride = max(1, int(config.timestep_stride))
-        start_t = int(min(config.start_timestep_value, pipe.scheduler.config.num_train_timesteps - 1))
-        custom_timesteps = torch.arange(start_t, -1, -stride, device=device, dtype=torch.int64)
-        pipe.scheduler.set_timesteps(timesteps=custom_timesteps.tolist(), device=device)
-        timesteps = pipe.scheduler.timesteps
-        t_start_index = 0
-        if verbose:
-            print(f"Using full contiguous timesteps from {start_t} → 0 with stride {stride} "
-                  f"({len(timesteps)} total steps).")
-    else:
-        pipe.scheduler.set_timesteps(config.steps, device=device)
-        full_timesteps = pipe.scheduler.timesteps
-
-        if config.start_timestep_value is not None:
-            target = torch.tensor(config.start_timestep_value, device=full_timesteps.device, dtype=full_timesteps.dtype)
-            t_start_index = int(torch.argmin(torch.abs(full_timesteps - target)).item())
-        else:
-            total_timesteps = len(full_timesteps)
-            steps_to_use = max(1, int(total_timesteps * config.strength))
-            t_start_index = max(total_timesteps - steps_to_use, 0)
-        timesteps = full_timesteps[t_start_index:]
-
-        if verbose:
-            start_ts_value = float(timesteps[0].item()) if isinstance(timesteps[0], torch.Tensor) else float(
-                timesteps[0])
-            print(
-                f"Using {len(timesteps)}/{len(full_timesteps)} timesteps, start index {t_start_index}, start t={start_ts_value:.1f}"
-            )
-            print(f"Timesteps: {timesteps}")
-
-    noise = torch.randn_like(init_latents)
+    timesteps, _ = _build_timesteps(pipe.scheduler, config, device=device, verbose=verbose)
     timestep = timesteps[0]
-    if verbose:
-        print(f"Adding noise at timestep {timestep}.")
-    if isinstance(timestep, torch.Tensor) and timestep.ndim == 0:
-        timestep = timestep.repeat(init_latents.shape[0])
-    # z_t = add_noise(z0, t) — SDEdit initialization
-    latents = pipe.scheduler.add_noise(init_latents, noise, timestep).detach().requires_grad_(True)
+    latents = _add_noise(pipe.scheduler, init_latents, timestep, verbose=verbose).detach().requires_grad_(True)
 
     # --- (Optional) reference teacher logits for extra KL stabilization --------
     reference_logits = None
@@ -323,6 +449,7 @@ def run_single_sample(
     denom = max(1, steps_to_run - 1)
     callback_every = max(1, int(callback_interval)) if callback_interval and callback_interval > 0 else max(
         1, steps_to_run)
+    guided_cycle_idx = 0
 
     # === Main reverse loop: predict noise → scheduler step → (optional) SGG ===
     for step_index, timestep in enumerate(timesteps):
@@ -336,64 +463,40 @@ def run_single_sample(
             noise_uncond, noise_text = noise_pred.chunk(2)
             noise_pred = noise_uncond + config.cfg * (noise_text - noise_uncond)
 
-        # Estimate x0 in latent space (clean sample) either from scheduler output or analytic formula.
-        # x0 = (z_t - sqrt(1-α_t) * ε_θ) / sqrt(α_t)
-        with torch.no_grad():
-            step_result = pipe.scheduler.step(noise_pred, timestep, latents.detach())
-        latents_next = step_result.prev_sample if hasattr(step_result, "prev_sample") else step_result[0]
-        pred_original_latents = getattr(step_result, "pred_original_sample", None)
-        if pred_original_latents is None:
-            alpha_prod_t = pipe.scheduler.alphas_cumprod[int(timestep)].to(device=latents.device, dtype=latents.dtype)
-            sqrt_alpha_t = torch.sqrt(alpha_prod_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_prod_t)
-            pred_original_latents = (latents.detach() - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
-        pred_original_latents = pred_original_latents.detach()
+        latents_next, pred_original_latents = _scheduler_step_with_x0(pipe.scheduler, latents, timestep, noise_pred)
 
         # Progress (0..1) inside the guided window
         progress = step_index / denom
-        if verbose:
-            print(f"Step {step_index}/{denom} progress {progress:.3f}")
-
         ce_loss_value: Optional[float] = None
-
-        # 3) SGG (GSG variant here): decode → teacher CE → backprop to latents
-        #    Paper’s Eq.(10): L_global(x_k^φ, y) = CE(g(x_k^φ), y)
-        if step_index % 2 == 0 and config.guide_start <= progress <= config.guide_end:
-            # --- Precompute constants for SGG guidance -------------------------------
-            alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
-            sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
-            eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
-
-            # Detach the scheduler’s z_{t-1}, then re-enable grads only on this node
-            latents_guided = latents_next.clone().detach().requires_grad_(True)
-
-            # Decode latents to image space x̂_0 ∈ [0,1] for the teacher
-            with _maybe_autocast(device.type, torch_dtype):
-                decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
-                decoded_01 = (decoded + 1) / 2  # [0,1]
-
-            # Global CE to source labels (GSG). For LCG you’d CE per-class on masked regions.
-            loss = ce_label(decoded_01, mask_batch, teacher_bundle)
-
-            # Optional: add KL against teacher logits on reference image (stabilizer; not in paper)
-            if config.use_kl and reference_logits is not None:
-                loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
-
-            # ∂loss/∂z_{t-1}: gradient in latent space (proxy for Eq.(7) mean adjustment)
-            grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
-            grad_norm = torch.linalg.norm(grad)
-            normalised_grad = grad / (grad_norm + config.grad_eps)
-
-            # 4) Apply the guidance step.
-            #    Paper: adjust μ_θ by λ Σ_θ ∇_x L and then sample. We approximate with step size η.
-            latents = (latents_next - eta_t * normalised_grad).detach().requires_grad_(True)
-
-            ce_loss_value = float(loss.detach().cpu())
-            ce_log.append(ce_loss_value)
+        guidance_window = (config.guide_start <= progress <= config.guide_end)
+        if guidance_window:
+            phase = guided_cycle_idx % 2  # 0: GSG, 1: LCG, 2-3: skip
+            guided_cycle_idx += 1
+            if phase in (0, 1):
+                mode = "gsg" if phase == 0 else "lcg"
+                latents, ce_loss_value = _maybe_apply_sgg(
+                    latents_next,
+                    timestep,
+                    progress,
+                    pipe=pipe,
+                    mask_batch=mask_batch,
+                    teacher_bundle=teacher_bundle,
+                    reference_logits=reference_logits,
+                    config=config,
+                    device=device,
+                    torch_dtype=torch_dtype,
+                    mode=mode,
+                )
+                print(f" Applied SGG ({mode.upper()}) this step; CE loss={ce_loss_value:.4f}")
+            else:
+                print(" Guidance window active but skipping SGG this step.")
+                latents = latents_next.detach().requires_grad_(True)
         else:
-            # No guidance at this step: just continue the reverse trajectory.
             print(" No SGG guidance at this step.")
             latents = latents_next.detach().requires_grad_(True)
+
+        if ce_loss_value is not None:
+            ce_log.append(ce_loss_value)
 
         # (Optional) logging every few steps: decode preview + teacher prediction
         should_log_step = (step_callback is not None and
@@ -495,15 +598,15 @@ def load_finetuned_pipeline(device: torch.device, dtype: torch.dtype) -> StableD
 
 def main(
     dataset_root: str | Path = "data/cityscapes",
-    split: str = "val",
-    out_dir: str | Path = "eval/plain_gsg_v6",
+    split: str = "my_test",
+    out_dir: str | Path = "eval/plain_sgg_v8",
     *,
     teacher_model: str = TEACHER_MODEL,
-    max_samples: Optional[int] = 4,
+    max_samples: Optional[int] = 2,
     num_workers: int = 8,
     seed: Optional[int] = 42,
     config: Optional[SamplerConfig] = None,
-    callback_interval: Optional[int] = 10,
+    callback_interval: Optional[int] = 5,
     step_callback: Optional[Callable[[StepOutput], None]] = None,
     verbose: bool = True,
 ) -> None:
@@ -531,20 +634,19 @@ def main(
     except Exception as exc:  # pragma: no cover - optional accel
         print(f"Could not enable xformers attention: {exc}")
 
-    # pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    from diffusers import DPMSolverMultistepScheduler
+    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 
-    use_karras = sampler_config.use_karras_sigmas and not sampler_config.full_denoise_from_start
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config,
-        algorithm_type="dpmsolver++",  # smaller noise jumps
-        use_karras_sigmas=use_karras,  # disable if using custom contiguous timesteps
-        timestep_spacing=sampler_config.timestep_spacing,  # trailing/leading/linspace
-        rescale_betas_zero_snr=True,  # flattens SNR so early steps are less destructive
-    )
-    # pipe.scheduler.set_timesteps(sampler_config.steps, device=device)
+    # from diffusers import DPMSolverMultistepScheduler
+    # use_karras = sampler_config.use_karras_sigmas and not sampler_config.full_denoise_from_start
+    # pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+    #     pipe.scheduler.config,
+    #     algorithm_type="dpmsolver++",  # smaller noise jumps
+    #     use_karras_sigmas=use_karras,  # disable if using custom contiguous timesteps
+    #     timestep_spacing=sampler_config.timestep_spacing,  # trailing/leading/linspace
+    #     rescale_betas_zero_snr=True,  # flattens SNR so early steps are less destructive
+    # )
+    # pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 
-    #pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     pipe.enable_attention_slicing()  # chunk attention to reduce peak memory
     pipe.enable_vae_slicing()  # decode in slices to save VRAM
     pipe.enable_vae_tiling()  # tile VAE for large images
@@ -589,7 +691,7 @@ def main(
         if idx >= total_steps:
             break
 
-        if idx != 3:
+        if idx != 1:
             continue
 
         sample_info = dataset.samples[idx]
