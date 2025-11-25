@@ -32,20 +32,23 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 
+OUTDIR = "eval/plain_sgg_v35"
+
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
-PROMPT = "foggy morning city traffic, diffused lights, detailed, immersive atmosphere"
-NEG = "overexposed, underexposed, blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
+PROMPT = "autonomous driving city scene at night with wet asphalt reflections, cinematic, high detail"
+NEG = "blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
 SIZE = (512, 512)
 STEPS = 100
-STRENGTH = 0.4  # 600/1000 step of denoising
+STRENGTH = 0.8  # 600/1000 step of denoising
 CFG = 7.5
 
 GUIDE_START, GUIDE_END = 0.0, 1.0
 ETA = 8.0
 GRAD_EPS = 1e-8
-USE_KL = False
-
+USE_KL = True
+CALLBACK_INTERVAL = 10  # log every N steps
+TEMPERATURE = 1.5
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 
@@ -66,8 +69,9 @@ class SamplerConfig:
     guide_end: float = GUIDE_END
     eta: float = ETA
     use_kl: bool = USE_KL
+    ce_temperature: float = TEMPERATURE
     grad_eps: float = GRAD_EPS
-    use_cycle: bool = False  # whether to alternate GSG/LCG/skip cycles
+    use_cycle: bool = True  # whether to alternate GSG/LCG/skip cycles
 
 
 @dataclass
@@ -133,8 +137,11 @@ def _build_timesteps(
         t_start_index = int(torch.argmin(torch.abs(full_timesteps - target)).item())
     else:
         total_timesteps = len(full_timesteps)
-        steps_to_use = max(1, int(total_timesteps * config.strength))
-        t_start_index = max(total_timesteps - steps_to_use, 0)
+        # steps_to_use = max(1, int(total_timesteps * config.strength))
+        # t_start_index = max(total_timesteps - steps_to_use, 0)
+
+        t_start_index = int((1.0 - config.strength) * total_timesteps)
+        t_start_index = max(0, min(total_timesteps - 1, t_start_index))
 
     timesteps = full_timesteps[t_start_index:]
 
@@ -192,19 +199,29 @@ def _maybe_apply_sgg(
     device: torch.device,
     torch_dtype: torch.dtype,
     mode: str = "gsg",
+    noise_pred: torch.Tensor,
 ) -> tuple[torch.Tensor, Optional[float]]:
     if not (config.guide_start <= progress <= config.guide_end):
         print(" No SGG guidance at this step.")
         return latents_next.detach().requires_grad_(True), None
 
+    #strongest when the image is almost pure noise
     alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
     eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
 
+    # sqrt_alpha_t = alpha_bar_t.sqrt()
+    # sqrt_one_minus_alpha_t = (1 - alpha_bar_t).sqrt()
+
+    print(f" Applying SGG ({mode.upper()}) with eta={eta_t:.4f} at progress={progress:.3f}")
+
     latents_guided = latents_next.clone().detach().requires_grad_(True)
+
+    # x0_hat_latents = (latents_guided - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
 
     with _maybe_autocast(device.type, torch_dtype):
         decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        #decoded = pipe.vae.decode(x0_hat_latents / pipe.vae.config.scaling_factor).sample  # [-1,1]
         decoded_01 = (decoded + 1) / 2  # [0,1]
 
     # Guidance branch selection
@@ -212,9 +229,9 @@ def _maybe_apply_sgg(
         loss = _lcg_loss(decoded_01, mask_batch, teacher_bundle)
         if loss is None:
             print(" LCG skipped (no valid class pixels); falling back to GSG.")
-            loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+            loss = ce_label(decoded_01, mask_batch, teacher_bundle, temperature=config.ce_temperature)
     else:
-        loss = ce_label(decoded_01, mask_batch, teacher_bundle)
+        loss = ce_label(decoded_01, mask_batch, teacher_bundle, temperature=config.ce_temperature)
 
     if config.use_kl and reference_logits is not None:
         loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
@@ -362,11 +379,14 @@ def ce_label(
     image_batch: torch.Tensor,
     mask: torch.Tensor,
     bundle: ModelBundle,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
     logits = compute_teacher_logits(image_batch, bundle, target_size=mask.shape[-2:])
     target = mask.to(device=logits.device, dtype=torch.long)
+    if temperature != 1.0:
+        logits = logits / temperature
     return F.cross_entropy(logits, target, ignore_index=IGNORE_LABEL)
 
 
@@ -462,6 +482,7 @@ def run_single_sample(
             noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
             noise_uncond, noise_text = noise_pred.chunk(2)
             noise_pred = noise_uncond + config.cfg * (noise_text - noise_uncond)
+            noise_pred_for_sgg = noise_pred.detach()
 
         latents_next, pred_original_latents = _scheduler_step_with_x0(pipe.scheduler, latents, timestep, noise_pred)
 
@@ -486,6 +507,7 @@ def run_single_sample(
                     device=device,
                     torch_dtype=torch_dtype,
                     mode=mode,
+                    noise_pred=noise_pred_for_sgg,
                 )
                 print(f" Applied SGG ({mode.upper()}) this step; CE loss={ce_loss_value:.4f}")
             else:
@@ -599,14 +621,14 @@ def load_finetuned_pipeline(device: torch.device, dtype: torch.dtype) -> StableD
 def main(
     dataset_root: str | Path = "data/cityscapes",
     split: str = "my_test",
-    out_dir: str | Path = "eval/plain_sgg_v8",
+    out_dir: str | Path = OUTDIR,
     *,
     teacher_model: str = TEACHER_MODEL,
     max_samples: Optional[int] = 2,
     num_workers: int = 8,
     seed: Optional[int] = 42,
     config: Optional[SamplerConfig] = None,
-    callback_interval: Optional[int] = 5,
+    callback_interval: Optional[int] = CALLBACK_INTERVAL,
     step_callback: Optional[Callable[[StepOutput], None]] = None,
     verbose: bool = True,
 ) -> None:
@@ -691,7 +713,7 @@ def main(
         if idx >= total_steps:
             break
 
-        if idx != 1:
+        if idx != 0:
             continue
 
         sample_info = dataset.samples[idx]
