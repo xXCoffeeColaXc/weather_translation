@@ -8,11 +8,12 @@ import contextlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
-from dataclasses import asdict
+from dataclasses import asdict, field
 import json
 import numpy as np
 import torch
 import torch.nn.functional as F
+import math
 from PIL import Image
 from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
 from torch.cuda.amp import autocast as cuda_autocast
@@ -32,23 +33,23 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 
-OUTDIR = "eval/plain_sgg_v35"
+OUTDIR = "eval/benchmark_010_gsg_kl"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
-PROMPT = "autonomous driving city scene at night with wet asphalt reflections, cinematic, high detail"
+PROMPT = "autonomous driving city scene at night with wet asphalt reflections, cinematic"
 NEG = "blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
 SIZE = (512, 512)
 STEPS = 100
-STRENGTH = 0.8  # 600/1000 step of denoising
+STRENGTH = 0.4  # 850/1000 step of denoising
 CFG = 7.5
 
 GUIDE_START, GUIDE_END = 0.0, 1.0
-ETA = 8.0
+ETA = 5.0
 GRAD_EPS = 1e-8
 USE_KL = True
-CALLBACK_INTERVAL = 10  # log every N steps
-TEMPERATURE = 1.5
+CALLBACK_INTERVAL = 5  # log every N steps
+TEMPERATURE = 1.0
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
 
@@ -68,10 +69,15 @@ class SamplerConfig:
     guide_start: float = GUIDE_START
     guide_end: float = GUIDE_END
     eta: float = ETA
+    lambda_ce: float = 0.1  # weight for CE loss in SGG
     use_kl: bool = USE_KL
     ce_temperature: float = TEMPERATURE
     grad_eps: float = GRAD_EPS
     use_cycle: bool = True  # whether to alternate GSG/LCG/skip cycles
+    guide_blur_sigma: float = 0.0  # optional Gaussian blur on guided image before teacher loss
+    guide_allowed_classes: Optional[list[
+        int]] = None  # field(default_factory=lambda: [0, 1, 11, 12, 13])  # only these class ids are kept for CE; others ignored
+    guide_tv_weight: float = 0.0  # optional TV penalty on the guided decode
 
 
 @dataclass
@@ -210,35 +216,56 @@ def _maybe_apply_sgg(
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
     eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
 
-    # sqrt_alpha_t = alpha_bar_t.sqrt()
-    # sqrt_one_minus_alpha_t = (1 - alpha_bar_t).sqrt()
+    sqrt_alpha_t = alpha_bar_t.sqrt()
+    sqrt_one_minus_alpha_t = (1 - alpha_bar_t).sqrt()
 
     print(f" Applying SGG ({mode.upper()}) with eta={eta_t:.4f} at progress={progress:.3f}")
 
     latents_guided = latents_next.clone().detach().requires_grad_(True)
 
-    # x0_hat_latents = (latents_guided - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
+    x0_hat_latents = (latents_guided - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
 
     with _maybe_autocast(device.type, torch_dtype):
-        decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
-        #decoded = pipe.vae.decode(x0_hat_latents / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        #decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        decoded = pipe.vae.decode(x0_hat_latents / pipe.vae.config.scaling_factor).sample  # [-1,1]
         decoded_01 = (decoded + 1) / 2  # [0,1]
+        decoded_01 = decoded_01.clamp(0.0, 1.0)
+        if config.guide_blur_sigma > 0:
+            decoded_01 = _gaussian_blur(decoded_01, config.guide_blur_sigma)
+
+    mask_for_loss = _mask_keep_classes(mask_batch, config.guide_allowed_classes)
 
     # Guidance branch selection
     if mode == "lcg":
-        loss = _lcg_loss(decoded_01, mask_batch, teacher_bundle)
+        loss = _lcg_loss(decoded_01, mask_for_loss, teacher_bundle)
         if loss is None:
             print(" LCG skipped (no valid class pixels); falling back to GSG.")
-            loss = ce_label(decoded_01, mask_batch, teacher_bundle, temperature=config.ce_temperature)
+            loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
     else:
-        loss = ce_label(decoded_01, mask_batch, teacher_bundle, temperature=config.ce_temperature)
+        loss = teacher_relative_loss(
+            decoded_01,
+            reference_logits,
+            teacher_bundle,
+            mask=mask_for_loss,
+            temperature=config.ce_temperature,
+        )
+        loss = loss + config.lambda_ce * ce_label(
+            decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+        #loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
 
-    if config.use_kl and reference_logits is not None:
-        loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
+    # if config.use_kl and reference_logits is not None:
+    #     loss = loss + 0.1 * kl_logits(reference_logits, decoded_01, teacher_bundle)
 
-    grad = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
-    grad_norm = torch.linalg.norm(grad)
-    normalised_grad = grad / (grad_norm + config.grad_eps)
+    if config.guide_tv_weight > 0:
+        loss = loss + config.guide_tv_weight * _total_variation(decoded_01)
+
+    grad_xt = torch.autograd.grad(loss, latents_guided, retain_graph=False)[0]
+    # max_norm = 10.0
+    # grad_norm = grad_xt.norm()
+    # if grad_norm > max_norm:
+    #     grad_xt = grad_xt * (max_norm / (grad_norm + 1e-6))
+    grad_norm = torch.linalg.norm(grad_xt)
+    normalised_grad = grad_xt / (grad_norm + config.grad_eps)
 
     latents_updated = (latents_next - eta_t * normalised_grad).detach().requires_grad_(True)
     return latents_updated, float(loss.detach().cpu())
@@ -401,6 +428,153 @@ def kl_logits(
     return F.kl_div(log_probs, ref_probs, reduction="batchmean")
 
 
+def teacher_relative_loss(
+    decoded_01: torch.Tensor,
+    reference_logits: torch.Tensor,
+    bundle: ModelBundle,
+    *,
+    mask: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Relative teacher loss: per-pixel KL( p_ref || p_cur ) between
+    teacher on original image (reference_logits) and teacher on current decoded image.
+
+    Optionally restrict to pixels where mask != IGNORE_LABEL.
+    """
+    device = reference_logits.device
+    # logits on current guided image
+    cand_logits = compute_teacher_logits(decoded_01, bundle, target_size=reference_logits.shape[-2:])
+    cand_logits = cand_logits.to(device=device)
+
+    ref_logits = reference_logits.to(device=device)
+
+    if temperature != 1.0:
+        cand_logits = cand_logits / temperature
+        ref_logits = ref_logits / temperature
+
+    cand_log_probs = F.log_softmax(cand_logits, dim=1)  # log p_cur
+    ref_probs = F.softmax(ref_logits.detach(), dim=1)  # p_ref (no grad through ref)
+
+    # pixelwise KL (shape [B, C, H, W])
+    kl_map = F.kl_div(
+        cand_log_probs,
+        ref_probs,
+        reduction="none",
+    )
+
+    # Reduce over channels: sum_c p_ref(c) * (log p_ref(c) - log p_cur(c))
+    kl_map = kl_map.sum(dim=1)  # [B, H, W]
+
+    if mask is not None:
+        # Restrict to valid pixels (and optionally allowed classes)
+        valid = (mask != IGNORE_LABEL).to(device=device)  # [B, H, W]
+        kl_map = kl_map * valid
+        denom = valid.float().sum().clamp_min(1.0)
+        return kl_map.sum() / denom
+    else:
+        return kl_map.mean()
+
+
+def _lcg_relative_loss(
+    decoded_01: torch.Tensor,
+    mask_batch: torch.Tensor,
+    reference_logits: torch.Tensor,
+    teacher_bundle: ModelBundle,
+    *,
+    temperature: float = 1.0,
+) -> Optional[torch.Tensor]:
+    """
+    Label-conditional *relative* guidance:
+    For each class present in mask_batch (excluding IGNORE_LABEL),
+    compute a per-class KL( p_ref || p_cur ) restricted to that class region,
+    then average across classes.
+
+    p_ref   = teacher(original_image)
+    p_cur   = teacher(decoded_01)
+    """
+    # Teacher logits for current guided image
+    cand_logits = compute_teacher_logits(decoded_01, teacher_bundle, target_size=mask_batch.shape[-2:])
+
+    # Reference teacher logits (from original image), already sized to mask resolution
+    ref_logits = reference_logits
+
+    if temperature != 1.0:
+        cand_logits = cand_logits / temperature
+        ref_logits = ref_logits / temperature
+
+    # [B, C, H, W]
+    cand_log_probs = F.log_softmax(cand_logits, dim=1)
+    ref_probs = F.softmax(ref_logits.detach(), dim=1)
+
+    B, C, H, W = cand_logits.shape
+
+    # Flatten spatial dims for easier masking
+    cand_log_probs_flat = cand_log_probs.permute(0, 2, 3, 1).reshape(-1, C)  # [B*H*W, C]
+    ref_probs_flat = ref_probs.permute(0, 2, 3, 1).reshape(-1, C)  # [B*H*W, C]
+    mask_flat = mask_batch.reshape(-1)  # [B*H*W]
+
+    classes = torch.unique(mask_batch)
+    classes = classes[classes != IGNORE_LABEL]
+    if classes.numel() == 0:
+        return None
+
+    per_class_losses = []
+    for cls in classes:
+        # select pixels of this class
+        region_mask = (mask_flat == cls)
+        if not region_mask.any():
+            continue
+        cand_lp_region = cand_log_probs_flat[region_mask]  # [N_c, C]
+        ref_p_region = ref_probs_flat[region_mask]  # [N_c, C]
+
+        # KL( p_ref || p_cur ) averaged over pixels in the region
+        kl_c = F.kl_div(
+            cand_lp_region,  # log p_cur
+            ref_p_region,  # p_ref
+            reduction="batchmean",
+        )
+        per_class_losses.append(kl_c)
+
+    if not per_class_losses:
+        return None
+
+    # Equal weight per class
+    return torch.stack(per_class_losses).mean()
+
+
+def _gaussian_blur(image: torch.Tensor, sigma: float) -> torch.Tensor:
+    if sigma <= 0:
+        return image
+    radius = int(math.ceil(3 * sigma))
+    kernel_size = 2 * radius + 1
+    coords = torch.arange(kernel_size, device=image.device, dtype=image.dtype) - radius
+    kernel_1d = torch.exp(-0.5 * (coords / sigma)**2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_h = kernel_1d.view(1, 1, 1, kernel_size)
+    kernel_v = kernel_1d.view(1, 1, kernel_size, 1)
+    channels = image.shape[1]
+    blurred = F.conv2d(image, kernel_h.expand(channels, 1, 1, kernel_size), padding=(0, radius), groups=channels)
+    blurred = F.conv2d(blurred, kernel_v.expand(channels, 1, kernel_size, 1), padding=(radius, 0), groups=channels)
+    return blurred
+
+
+def _total_variation(x: torch.Tensor) -> torch.Tensor:
+    dx = x[:, :, 1:, :] - x[:, :, :-1, :]
+    dy = x[:, :, :, 1:] - x[:, :, :, :-1]
+    return (dx.abs().mean() + dy.abs().mean())
+
+
+def _mask_keep_classes(mask: torch.Tensor, allowed: Optional[list[int]]) -> torch.Tensor:
+    if not allowed:
+        return mask
+    allowed_t = torch.tensor(allowed, device=mask.device, dtype=mask.dtype)
+    keep = (mask.unsqueeze(-1) == allowed_t).any(dim=-1)
+    masked = mask.clone()
+    masked[~keep] = IGNORE_LABEL
+    return masked
+
+
 def _lcg_loss(
     decoded_01: torch.Tensor,
     mask_batch: torch.Tensor,
@@ -494,7 +668,7 @@ def run_single_sample(
             phase = guided_cycle_idx % 2  # 0: GSG, 1: LCG, 2-3: skip
             guided_cycle_idx += 1
             if phase in (0, 1):
-                mode = "gsg" if phase == 0 else "lcg"
+                mode = "gsg"  # if phase == 0 else "lcg"
                 latents, ce_loss_value = _maybe_apply_sgg(
                     latents_next,
                     timestep,
@@ -713,7 +887,7 @@ def main(
         if idx >= total_steps:
             break
 
-        if idx != 0:
+        if idx != 1:
             continue
 
         sample_info = dataset.samples[idx]

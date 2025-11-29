@@ -7,3 +7,8 @@
 NOTES:
 - GSG seems to work, added extra cars
 - N supposly controlls domain change ? 
+
+
+- try out KL on GSG only 
+- try blend xt grad and x_hat0 grad together
+- try guide_allowed_classes with new

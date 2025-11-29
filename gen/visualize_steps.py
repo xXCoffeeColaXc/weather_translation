@@ -2,9 +2,10 @@
 Utility to visualize diffusion debug steps.
 
 Given a steps directory containing files like `step_000_t0501_image.png` and
-`step_000_t0501_mask.png`, this script stitches all steps horizontally and
-plots two rows: the generated images and their masks. Tick labels show the
-step index and timestep.
+`step_000_t0501_mask.png` (and optionally `step_000_t0501_x0.png`), this script
+stitches all steps horizontally and plots the generated images, predicted x0
+images (if present), and their masks. Tick labels show the step index and
+timestep.
 """
 
 from __future__ import annotations
@@ -19,9 +20,10 @@ import numpy as np
 from PIL import Image
 
 
-def _parse_steps(steps_dir: Path):
+def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool]:
     pattern = re.compile(r"step_(\d+)_t(\d+)_image\.png$")
     entries = []
+    x0_presence = []
     for image_path in sorted(steps_dir.glob("step_*_image.png")):
         match = pattern.match(image_path.name)
         if not match:
@@ -31,11 +33,26 @@ def _parse_steps(steps_dir: Path):
         mask_path = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_mask.png"
         if not mask_path.exists():
             raise FileNotFoundError(f"Missing mask for {image_path.name}: {mask_path.name}")
-        entries.append({"step": step, "t": timestep, "image": image_path, "mask": mask_path})
+        x0_path = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_x0.png"
+        x0_exists = x0_path.exists()
+        x0_presence.append(x0_exists)
+        entries.append(
+            {
+                "step": step,
+                "t": timestep,
+                "image": image_path,
+                "mask": mask_path,
+                "x0": x0_path if x0_exists else None,
+            }
+        )
     if not entries:
         raise FileNotFoundError(f"No step_*_image.png files found in {steps_dir}")
     entries.sort(key=lambda x: x["step"])
-    return entries
+    has_x0 = all(x0_presence) if x0_presence else False
+    if any(x0_presence) and not has_x0:
+        missing = [e["image"].name for e in entries if e["x0"] is None]
+        raise FileNotFoundError(f"x0 files missing for steps: {', '.join(missing)}")
+    return entries, has_x0
 
 
 def _compute_tile_height(
@@ -67,8 +84,9 @@ def _load_and_resize(path: Path, height: int) -> np.ndarray:
         return np.asarray(resized)
 
 
-def build_rows(entries: list[dict], tile_height: int):
+def build_rows(entries: list[dict], tile_height: int, *, include_x0: bool):
     image_tiles = []
+    x0_tiles = []
     mask_tiles = []
     xtick_positions = []
     xtick_labels = []
@@ -77,6 +95,7 @@ def build_rows(entries: list[dict], tile_height: int):
     for entry in entries:
         image_arr = _load_and_resize(entry["image"], tile_height)
         mask_arr = _load_and_resize(entry["mask"], tile_height)
+        x0_arr = _load_and_resize(entry["x0"], tile_height) if include_x0 else None
 
         tile_width = image_arr.shape[1]
         center = cursor + tile_width / 2
@@ -85,16 +104,19 @@ def build_rows(entries: list[dict], tile_height: int):
 
         cursor += tile_width
         image_tiles.append(image_arr)
+        if include_x0:
+            x0_tiles.append(x0_arr)
         mask_tiles.append(mask_arr)
 
-    image_row = np.concatenate(image_tiles, axis=1)
-    mask_row = np.concatenate(mask_tiles, axis=1)
-    return image_row, mask_row, xtick_positions, xtick_labels
+    rows = [("Images", np.concatenate(image_tiles, axis=1))]
+    if include_x0:
+        rows.append(("x0", np.concatenate(x0_tiles, axis=1)))
+    rows.append(("Masks", np.concatenate(mask_tiles, axis=1)))
+    return rows, xtick_positions, xtick_labels
 
 
 def plot_steps(
-    image_row: np.ndarray,
-    mask_row: np.ndarray,
+    rows: list[tuple[str, np.ndarray]],
     xtick_positions: list[float],
     xtick_labels: list[str],
     *,
@@ -102,15 +124,21 @@ def plot_steps(
     dpi: int,
     show: bool,
 ) -> None:
-    width = image_row.shape[1]
-    height = image_row.shape[0] + mask_row.shape[0]
+    if not rows:
+        raise ValueError("No rows to plot.")
+
+    width = rows[0][1].shape[1]
+    if any(row[1].shape[1] != width for row in rows):
+        raise ValueError("All rows must have the same width after concatenation.")
+    height = sum(row[1].shape[0] for row in rows)
     fig_width_in = max(8.0, width / dpi)
     fig_height_in = max(4.0, height / dpi)
 
-    fig, axes = plt.subplots(2, 1, figsize=(fig_width_in, fig_height_in), dpi=dpi, constrained_layout=True)
-    axes_data = [("Images", image_row), ("Masks", mask_row)]
+    fig, axes = plt.subplots(len(rows), 1, figsize=(fig_width_in, fig_height_in), dpi=dpi, constrained_layout=True)
+    if len(rows) == 1:
+        axes = [axes]
 
-    for ax, (title, data) in zip(axes, axes_data):
+    for ax, (title, data) in zip(axes, rows):
         ax.imshow(data)
         ax.set_title(title)
         ax.set_xticks(xtick_positions)
@@ -126,7 +154,7 @@ def plot_steps(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize step debug images and masks.")
+    parser = argparse.ArgumentParser(description="Visualize step debug images, predicted x0, and masks.")
     parser.add_argument("steps_dir", type=Path, help="Path to steps directory (contains step_*_image.png files).")
     parser.add_argument(
         "--output",
@@ -149,15 +177,14 @@ def main() -> None:
     if not steps_dir.exists():
         raise FileNotFoundError(f"Steps directory not found: {steps_dir}")
 
-    entries = _parse_steps(steps_dir)
+    entries, has_x0 = _parse_steps(steps_dir)
     tile_height = _compute_tile_height(entries, args.tile_height, args.max_width)
 
-    image_row, mask_row, xtick_positions, xtick_labels = build_rows(entries, tile_height)
+    rows, xtick_positions, xtick_labels = build_rows(entries, tile_height, include_x0=has_x0)
 
     output_path = args.output or steps_dir / "steps_overview.png"
     plot_steps(
-        image_row,
-        mask_row,
+        rows,
         xtick_positions,
         xtick_labels,
         output=output_path,
