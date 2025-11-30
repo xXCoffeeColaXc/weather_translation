@@ -6,6 +6,7 @@ from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 from PIL import Image
+from torchvision.transforms import transforms
 
 from seg.dataloaders.labels import labels as CITYSCAPES_LABELS
 
@@ -35,6 +36,23 @@ def build_joint_resize(size: Tuple[int, int]) -> Callable[[Image.Image, Image.Im
         return resized_image, resized_mask
 
     return _resize
+
+
+def build_joint_randomresizedcrop(size: int) -> Callable:
+
+    def _crop(image: Image.Image, mask: Image.Image):
+        crop = transforms.RandomResizedCrop(
+            size=size,
+            scale=(0.8, 1.0),
+            ratio=(0.95, 1.05),
+            interpolation=transforms.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        image = crop(image)
+        mask = crop(mask)
+        return image, mask
+
+    return _crop
 
 
 def get_class_names() -> List[str]:

@@ -13,3 +13,5 @@ data/*
 /eval/sgg_experiments
 /wandb
 /eval
+/eval_kl
+/eval_teacher

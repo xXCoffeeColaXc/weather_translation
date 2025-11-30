@@ -223,9 +223,9 @@ def create_step_callback(
         mask_image = mask_to_color(step.predicted_mask[0])
         mask_image.save(mask_path)
         state["last_mask"] = step.predicted_mask
-        ce_repr = f"{step.ce_loss:.6f}" if step.ce_loss is not None else "NA"
+        ce_repr = f"{step.sgg_loss:.6f}" if step.sgg_loss is not None else "NA"
         logger.info(
-            "%s | step=%03d t=%d progress=%.3f ce=%s",
+            "%s | step=%03d t=%d progress=%.3f sgg_loss=%s",
             config_name,
             step.step_index,
             step.timestep,
@@ -401,7 +401,7 @@ def main() -> None:
             state=callback_state,
         )
 
-        decoded_01, ce_log = run_single_sample(
+        decoded_01, sgg_log = run_single_sample(
             pipe,
             teacher_bundle,
             image_pil=image_pil,
@@ -419,8 +419,8 @@ def main() -> None:
         decoded_path = config_dir / "decoded.png"
         save_01(decoded_01, decoded_path)
 
-        ce_path = config_dir / "ce_losses.npy"
-        np.save(ce_path, np.array(ce_log, dtype=np.float32))
+        sgg_path = config_dir / "sgg_losses.npy"
+        np.save(sgg_path, np.array(sgg_log, dtype=np.float32))
 
         if "last_mask" in callback_state:
             final_mask_path = config_dir / "final_pred_mask.png"
@@ -435,9 +435,9 @@ def main() -> None:
             mask_to_color(final_logits[0]).save(config_dir / "final_pred_mask.png")
 
         logger.info(
-            "%s | completed with %d CE loss entries. Outputs saved under %s",
+            "%s | completed with %d SGG loss entries. Outputs saved under %s",
             config_name,
-            len(ce_log),
+            len(sgg_log),
             config_dir,
         )
 
