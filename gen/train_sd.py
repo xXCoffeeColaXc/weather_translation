@@ -1,6 +1,6 @@
 from __future__ import annotations
-import contextlib
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -10,6 +10,9 @@ from tqdm.auto import tqdm
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision.transforms import functional as TF
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -20,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from gen.dataloader import ACDCDataset, build_training_transform
+from seg.dataloaders.labels import labels as CITYSCAPES_LABELS, IGNORE_LABEL
 
 logger = get_logger(__name__)
 
@@ -31,6 +35,8 @@ SUPPORTED_SCHEDULERS = (
     "constant",
     "constant_with_warmup",
 )
+
+TRAIN_ID_TO_NAME = {label.trainId: label.name for label in CITYSCAPES_LABELS if 0 <= label.trainId < 255}
 
 
 def parse_condition_prompts(
@@ -53,6 +59,81 @@ def parse_condition_prompts(
     return mapping
 
 
+class MaskPromptBuilder:
+
+    def __init__(
+        self,
+        *,
+        dataset_root: Path,
+        mask_root: Path,
+        mask_suffix: str,
+        mask_ext: str,
+        top_k: int,
+        min_frac: float,
+        prompt_template: str,
+    ) -> None:
+        self.dataset_root = dataset_root.resolve()
+        self.mask_root = mask_root.resolve()
+        self.mask_suffix = mask_suffix
+        self.mask_ext = mask_ext if mask_ext.startswith(".") else f".{mask_ext}"
+        self.top_k = max(1, int(top_k))
+        self.min_frac = max(0.0, float(min_frac))
+        self.prompt_template = prompt_template
+
+    def _mask_path_for_image(self, image_path: Path) -> Path:
+        relative = image_path.resolve().relative_to(self.dataset_root)
+        mask_stem = image_path.stem
+        if mask_stem.endswith("_rgb_anon"):
+            mask_stem = f"{mask_stem[: -len('_rgb_anon')]}_gt"
+        return self.mask_root / relative.parent / f"{mask_stem}{self.mask_suffix}{self.mask_ext}"
+
+    def _mask_classes(self, mask_path: Path) -> list[str]:
+        if not mask_path.exists():
+            return []
+        mask = np.array(Image.open(mask_path).convert("L"))
+        valid = mask != IGNORE_LABEL
+        if not valid.any():
+            return []
+        values, counts = np.unique(mask[valid], return_counts=True)
+        total = counts.sum()
+        pairs = sorted(zip(values.tolist(), counts.tolist()), key=lambda p: p[1], reverse=True)
+        names: list[str] = []
+        for value, count in pairs:
+            frac = count / total
+            name = TRAIN_ID_TO_NAME.get(int(value))
+            if name is None or frac < self.min_frac:
+                continue
+            if name not in ['sky', 'road', 'vegetation', 'sky', 'terrain']:  # prefer more dynamic classes
+                names.append(name)
+
+        names_capped = []
+        if len(names) > self.top_k:
+            has_car = 'car' in names
+            has_pedestrian = 'person' in names
+            names_capped = names[:self.top_k]
+            if has_car and 'car' not in names_capped:
+                names_capped.append('car')
+            if has_pedestrian and 'person' not in names_capped:
+                names_capped.append('person')
+        return names_capped
+
+    def __call__(self, image_path: Path) -> str | None:
+        try:
+            mask_path = self._mask_path_for_image(image_path)
+        except ValueError:
+            return None
+        classes = self._mask_classes(mask_path)
+        # print(f"Found classes in mask: {classes} in {mask_path}")
+        if not classes:
+            return None
+        if 'building' not in classes:
+            # we know its a rural setup
+            roadcategory = 'highway'
+        else:
+            roadcategory = 'urban'
+        return self.prompt_template.format(classes=", ".join(classes), roadcategory=roadcategory)
+
+
 class PromptedACDCDataset(Dataset[dict]):
     """Wrap `ACDCDataset` to attach textual prompts."""
 
@@ -62,11 +143,13 @@ class PromptedACDCDataset(Dataset[dict]):
         *,
         prompt_map: Dict[str, str],
         prompt_template: str,
+        mask_prompt_builder: MaskPromptBuilder | None = None,
     ) -> None:
         self.dataset = dataset
         self.prompt_map = dict(prompt_map)
         self.prompt_template = prompt_template
         self._root = dataset.root_dir
+        self._mask_prompt_builder = mask_prompt_builder
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -84,6 +167,15 @@ class PromptedACDCDataset(Dataset[dict]):
         image_path = Path(self.dataset.image_paths[idx])
         condition = self._condition_from_path(image_path)
         prompt = self.prompt_map.get(condition, self.prompt_template.format(condition=condition))
+        # print(f"Initial prompt: {prompt}")
+        if self._mask_prompt_builder is not None:
+            # print("Mask prompt builder active")
+            mask_prompt = self._mask_prompt_builder(image_path)
+            # print(f"Mask prompt: {mask_prompt}")
+            if mask_prompt:
+                prompt = f"{prompt}. {mask_prompt}"
+                # print(f"Augmented prompt: {prompt} for image {image_path}")
+                # print("-" * 80)
         return {
             "pixel_values": pixel_values,
             "prompt": prompt,
@@ -159,14 +251,13 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("gen/checkpoints/sd_lora_finetune_50ep_lora32"),
+        default=Path("gen/checkpoints/sd_lora_finetune_100ep_lora128_dyna_maskprompts"),
         help="Where to write checkpoints and logs.",
     )
-    # TODO: add exo objects, vehicles, bicycle, pedestrians flags
     parser.add_argument(
         "--prompt-template",
         type=str,
-        default="autonomous driving scene at {condition}, cinematic, detailed, wet asphalt reflections",
+        default="autonomous driving scene at {condition}, realistic, detailed, road and surroundings visible",
         help="Fallback prompt template. The token '{condition}' will be replaced with the folder name.",
     )
     parser.add_argument(
@@ -175,9 +266,51 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         help="Optional overrides in the form condition=prompt text.",
     )
-    parser.add_argument("--train-batch-size", type=int, default=2, help="Per device batch size.")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
-    parser.add_argument("--num-epochs", type=int, default=50, help="Number of passes through the dataset.")
+    parser.add_argument(
+        "--use-mask-prompts",
+        action="store_true",
+        help="Augment prompts with semantic classes extracted from label masks.",
+    )
+    parser.add_argument(
+        "--mask-root",
+        type=Path,
+        default="data/acdc/gt",
+        help="Root directory mirroring the image tree that holds segmentation masks.",
+    )
+    parser.add_argument(
+        "--mask-suffix",
+        type=str,
+        default="_labelTrainIds",
+        help="Optional suffix appended to the image stem when looking up masks (e.g., _labelTrainIds).",
+    )
+    parser.add_argument(
+        "--mask-ext",
+        type=str,
+        default=".png",
+        help="Mask file extension (default: .png).",
+    )
+    parser.add_argument(
+        "--mask-topk",
+        type=int,
+        default=4,
+        help="Number of top classes to include in mask-derived prompt text.",
+    )
+    parser.add_argument(
+        "--mask-min-frac",
+        type=float,
+        default=0.01,
+        help="Minimum area fraction for a class to be mentioned in the prompt.",
+    )
+    parser.add_argument(
+        "--mask-prompt-template",
+        type=str,
+        default="Scene contains {classes} in a {roadcategory} setting.",
+        help=
+        "Template to describe classes from the mask. {classes} will be replaced with a comma-separated list and {roadcategory} with the environment type.",
+    )
+    parser.add_argument("--train-batch-size", type=int, default=4, help="Per device batch size.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument("--num-epochs", type=int, default=100, help="Number of passes through the dataset.")
     parser.add_argument("--max-train-steps", type=int, default=None, help="Total optimisation steps. Overrides epochs.")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=SUPPORTED_SCHEDULERS)
@@ -192,8 +325,8 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-text-encoder", action="store_true", help="Also fine-tune the CLIP text encoder.")
     parser.add_argument("--use-lora", action="store_true", help="Train LoRA adapters instead of full UNet.")
-    parser.add_argument("--lora-rank", type=int, default=16)
-    parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--lora-rank", type=int, default=128)
+    parser.add_argument("--lora-alpha", type=float, default=128.0)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--checkpointing-steps", type=int, default=1000, help="Checkpoint frequency in global steps.")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to an accelerator state directory.")
@@ -202,16 +335,19 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
         "--validation-prompts",
         nargs="*",
         default=[
-            "autonomous driving city scene at night with wet asphalt reflections, cinematic, high detail",
+            "autonomous driving city scene at night, realistic lighting, high detail",
             "dense urban street in heavy rain, headlights, realistic lighting, photorealistic",
             "foggy morning city traffic, diffused lights, detailed, immersive atmosphere",
         ],
     )
-    parser.add_argument("--validation-steps", type=int, default=None, help="Frequency for validation image sampling.")
+    parser.add_argument("--validation-steps", type=int, default=1000, help="Frequency for validation image sampling.")
     parser.add_argument("--validation-num-images", type=int, default=2)
     parser.add_argument("--sample-num-inference-steps", type=int, default=30)
     parser.add_argument("--sample-guidance-scale", type=float, default=7.5)
-    parser.add_argument("--report-to", nargs="*", default=[], help="Optional accelerate trackers, e.g. tensorboard.")
+    parser.add_argument("--report-to",
+                        nargs="*",
+                        default=["wandb"],
+                        help="Optional accelerate trackers, e.g. tensorboard.")
     parser.add_argument("--wandb-project", type=str, default="weather-converter-sd1.5", help="W&B project name.")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Optional W&B run name.")
 
@@ -339,7 +475,24 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader[Dict[str, object]]:
     )
 
     prompt_map = parse_condition_prompts(args.condition_prompt, prompt_template=args.prompt_template)
-    prompted = PromptedACDCDataset(dataset, prompt_map=prompt_map, prompt_template=args.prompt_template)
+    mask_builder = None
+    if args.use_mask_prompts:
+        mask_root = args.mask_root or args.dataset_root
+        mask_builder = MaskPromptBuilder(
+            dataset_root=Path(args.dataset_root),
+            mask_root=Path(mask_root),
+            mask_suffix=args.mask_suffix,
+            mask_ext=args.mask_ext,
+            top_k=args.mask_topk,
+            min_frac=args.mask_min_frac,
+            prompt_template=args.mask_prompt_template,
+        )
+    prompted = PromptedACDCDataset(
+        dataset,
+        prompt_map=prompt_map,
+        prompt_template=args.prompt_template,
+        mask_prompt_builder=mask_builder,
+    )
 
     loader = DataLoader(
         prompted,
@@ -470,6 +623,10 @@ def train(args: argparse.Namespace) -> None:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save training arguments
+    with open(args.output_dir / "training_args.json", "w") as f:
+        json.dump(vars(args), f, indent=2, default=str)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -489,6 +646,19 @@ def train(args: argparse.Namespace) -> None:
         set_seed(args.seed)
 
     train_dataloader = build_dataloader(args)
+
+    print("Created dataset with: ", len(train_dataloader.dataset))
+
+    # test first batch first element image and its prompt by saving to output dir
+    if accelerator.is_main_process:
+        batch = next(iter(train_dataloader))
+        sample_image = batch["pixel_values"][0]
+        sample_image = sample_image.add(1).div(2).clamp(0, 1)  # bring into [0,1]
+        sample_prompt = batch["prompts"][0]
+        sample_image_pil = TF.to_pil_image(sample_image)
+        sample_image_pil.save(args.output_dir / "sample_input_image.png")
+        with open(args.output_dir / "sample_input_prompt.txt", "w") as f:
+            f.write(sample_prompt)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:

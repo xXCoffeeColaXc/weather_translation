@@ -12,3 +12,12 @@ NOTES:
 - try out KL on GSG only 
 - try blend xt grad and x_hat0 grad together
 - try guide_allowed_classes with new
+
+
+- csinaljuk meg a dinamikus promptokat, remelve hogy ekkor a text guide nem annyira huz el minket sgg guide-tol. 
+- otlet: ha a prompt is azt mondja ami a szemantikus masz akkor jobb alignment van. 
+- amikor a text guidance csak foggy driving scene-t akar generalni, nem fog auto iranyaba generalni, ami ellen megy az sgg-nek. 
+- de ha a prompt tartalmazza az autot és alapbol ugy lett finetuneolva akkor, remelhetoeleg a ketto "ero" ugyanabban az iranyba akarja mozgatni a a generalast. 
+
+
+- instead of random crop 512 use resize to kisebb oldal and then crop to maintain realistic point of view

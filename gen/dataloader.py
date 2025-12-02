@@ -146,22 +146,15 @@ class ACDCDataset(data.Dataset):
 
 
 def build_training_transform(image_size: int) -> transforms.Compose:
-    """Default augmentation pipeline for model training."""
+    """Downsample full frames then center-crop to square for training."""
 
     return transforms.Compose([
-        # transforms.Resize(
-        #     image_size,
-        #     transforms.InterpolationMode.BILINEAR,
-        # ),
-        transforms.RandomResizedCrop(
-            size=image_size,
-            scale=(0.8, 1.0),  # small zoom-in/outs
-            ratio=(0.95, 1.05),  # keep near square to avoid distortions
+        transforms.Resize(
+            (image_size, image_size * 2),  # e.g., 512x1024 from 1024x2048
             interpolation=transforms.InterpolationMode.BICUBIC,
             antialias=True,
         ),
-        transforms.RandomCrop(image_size),
-        # transforms.RandomHorizontalFlip(),
+        transforms.CenterCrop(image_size),  # take the centre square region
         transforms.ToTensor(),
         transforms.Lambda(lambda tensor: tensor * 2.0 - 1.0),
     ])

@@ -6,7 +6,7 @@ from typing import Callable, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torchvision.transforms import transforms
+from torchvision.transforms import functional as TF, transforms
 
 from seg.dataloaders.labels import labels as CITYSCAPES_LABELS
 
@@ -40,19 +40,39 @@ def build_joint_resize(size: Tuple[int, int]) -> Callable[[Image.Image, Image.Im
 
 def build_joint_randomresizedcrop(size: int) -> Callable:
 
+    def _crop_resize(image: Image.Image, mask: Image.Image) -> Tuple[Image.Image, Image.Image]:
+        image = TF.resize(image, (size, size * 2), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+        image = TF.center_crop(image, size)
+        mask = TF.resize(mask, (size, size * 2), interpolation=transforms.InterpolationMode.NEAREST, antialias=False)
+        mask = TF.center_crop(mask, size)
+        return image, mask
+
     def _crop(image: Image.Image, mask: Image.Image):
-        crop = transforms.RandomResizedCrop(
-            size=size,
-            scale=(0.8, 1.0),
-            ratio=(0.95, 1.05),
+        # Sample once, then apply the same crop params to image and mask to keep alignment.
+        i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=(0.8, 1.0), ratio=(0.95, 1.05))
+        image = TF.resized_crop(
+            image,
+            top=i,
+            left=j,
+            height=h,
+            width=w,
+            size=(size, size),
             interpolation=transforms.InterpolationMode.BICUBIC,
             antialias=True,
         )
-        image = crop(image)
-        mask = crop(mask)
+        mask = TF.resized_crop(
+            mask,
+            top=i,
+            left=j,
+            height=h,
+            width=w,
+            size=(size, size),
+            interpolation=transforms.InterpolationMode.NEAREST,
+            antialias=False,
+        )
         return image, mask
 
-    return _crop
+    return _crop_resize
 
 
 def get_class_names() -> List[str]:

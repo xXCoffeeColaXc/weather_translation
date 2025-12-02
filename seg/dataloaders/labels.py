@@ -95,6 +95,8 @@ labels = [
 
 # yapf: enable
 
+IGNORE_LABEL = 255
+
 
 def get_train_ids():
     train_ids = []

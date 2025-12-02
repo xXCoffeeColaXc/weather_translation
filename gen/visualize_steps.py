@@ -20,10 +20,16 @@ import numpy as np
 from PIL import Image
 
 
-def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool]:
+def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool, dict[str, bool]]:
     pattern = re.compile(r"step_(\d+)_t(\d+)_image\.png$")
     entries = []
-    x0_presence = []
+    presence = {
+        "x0": [],
+        "guidance_grad": [],
+        "tr_grad": [],
+        "guidance_overlay": [],
+        "tr_overlay": [],
+    }
     for image_path in sorted(steps_dir.glob("step_*_image.png")):
         match = pattern.match(image_path.name)
         if not match:
@@ -34,8 +40,22 @@ def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool]:
         if not mask_path.exists():
             raise FileNotFoundError(f"Missing mask for {image_path.name}: {mask_path.name}")
         x0_path = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_x0.png"
+        guidance_grad = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_guidance_grad.png"
+        tr_grad = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_tr_grad.png"
+        guidance_overlay = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_guidance_overlay.png"
+        tr_overlay = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_tr_overlay.png"
+
         x0_exists = x0_path.exists()
-        x0_presence.append(x0_exists)
+        guidance_grad_exists = guidance_grad.exists()
+        tr_grad_exists = tr_grad.exists()
+        guidance_overlay_exists = guidance_overlay.exists()
+        tr_overlay_exists = tr_overlay.exists()
+
+        presence["x0"].append(x0_exists)
+        presence["guidance_grad"].append(guidance_grad_exists)
+        presence["tr_grad"].append(tr_grad_exists)
+        presence["guidance_overlay"].append(guidance_overlay_exists)
+        presence["tr_overlay"].append(tr_overlay_exists)
         entries.append(
             {
                 "step": step,
@@ -43,16 +63,29 @@ def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool]:
                 "image": image_path,
                 "mask": mask_path,
                 "x0": x0_path if x0_exists else None,
+                "guidance_grad": guidance_grad if guidance_grad_exists else None,
+                "tr_grad": tr_grad if tr_grad_exists else None,
+                "guidance_overlay": guidance_overlay if guidance_overlay_exists else None,
+                "tr_overlay": tr_overlay if tr_overlay_exists else None,
             }
         )
     if not entries:
         raise FileNotFoundError(f"No step_*_image.png files found in {steps_dir}")
     entries.sort(key=lambda x: x["step"])
-    has_x0 = all(x0_presence) if x0_presence else False
-    if any(x0_presence) and not has_x0:
+    # Optional artifacts: allow missing; visualizer will render black tiles when absent
+    availability: dict[str, bool] = {}
+    for key in presence.keys():
+        if key == "x0":
+            continue
+        availability[key] = any(entry[key] is not None for entry in entries)
+
+    # x0 remains strict: either all present or none
+    has_x0 = all(presence["x0"]) if presence["x0"] else False
+    if any(presence["x0"]) and not has_x0:
         missing = [e["image"].name for e in entries if e["x0"] is None]
         raise FileNotFoundError(f"x0 files missing for steps: {', '.join(missing)}")
-    return entries, has_x0
+
+    return entries, has_x0, availability
 
 
 def _compute_tile_height(
@@ -84,10 +117,23 @@ def _load_and_resize(path: Path, height: int) -> np.ndarray:
         return np.asarray(resized)
 
 
-def build_rows(entries: list[dict], tile_height: int, *, include_x0: bool):
+def build_rows(
+    entries: list[dict],
+    tile_height: int,
+    *,
+    include_x0: bool,
+    include_guidance_grad: bool,
+    include_tr_grad: bool,
+    include_guidance_overlay: bool,
+    include_tr_overlay: bool,
+):
     image_tiles = []
     x0_tiles = []
     mask_tiles = []
+    guidance_grad_tiles = []
+    tr_grad_tiles = []
+    guidance_overlay_tiles = []
+    tr_overlay_tiles = []
     xtick_positions = []
     xtick_labels = []
     cursor = 0
@@ -95,9 +141,19 @@ def build_rows(entries: list[dict], tile_height: int, *, include_x0: bool):
     for entry in entries:
         image_arr = _load_and_resize(entry["image"], tile_height)
         mask_arr = _load_and_resize(entry["mask"], tile_height)
-        x0_arr = _load_and_resize(entry["x0"], tile_height) if include_x0 else None
-
         tile_width = image_arr.shape[1]
+
+        def _load_optional(path: Path | None) -> np.ndarray:
+            if path is None:
+                return np.zeros((tile_height, tile_width, 3), dtype=np.uint8)
+            return _load_and_resize(path, tile_height)
+
+        x0_arr = _load_and_resize(entry["x0"], tile_height) if include_x0 else None
+        guidance_grad_arr = _load_optional(entry["guidance_grad"]) if include_guidance_grad else None
+        tr_grad_arr = _load_optional(entry["tr_grad"]) if include_tr_grad else None
+        guidance_overlay_arr = _load_optional(entry["guidance_overlay"]) if include_guidance_overlay else None
+        tr_overlay_arr = _load_optional(entry["tr_overlay"]) if include_tr_overlay else None
+
         center = cursor + tile_width / 2
         xtick_positions.append(center)
         xtick_labels.append(f"step {entry['step']}\n(t={entry['t']})")
@@ -107,10 +163,26 @@ def build_rows(entries: list[dict], tile_height: int, *, include_x0: bool):
         if include_x0:
             x0_tiles.append(x0_arr)
         mask_tiles.append(mask_arr)
+        if include_guidance_grad:
+            guidance_grad_tiles.append(guidance_grad_arr)
+        if include_tr_grad:
+            tr_grad_tiles.append(tr_grad_arr)
+        if include_guidance_overlay:
+            guidance_overlay_tiles.append(guidance_overlay_arr)
+        if include_tr_overlay:
+            tr_overlay_tiles.append(tr_overlay_arr)
 
     rows = [("Images", np.concatenate(image_tiles, axis=1))]
     if include_x0:
         rows.append(("x0", np.concatenate(x0_tiles, axis=1)))
+    if include_guidance_grad:
+        rows.append(("Guidance grad", np.concatenate(guidance_grad_tiles, axis=1)))
+    if include_tr_grad:
+        rows.append(("TR grad", np.concatenate(tr_grad_tiles, axis=1)))
+    if include_guidance_overlay:
+        rows.append(("Guidance overlay", np.concatenate(guidance_overlay_tiles, axis=1)))
+    if include_tr_overlay:
+        rows.append(("TR overlay", np.concatenate(tr_overlay_tiles, axis=1)))
     rows.append(("Masks", np.concatenate(mask_tiles, axis=1)))
     return rows, xtick_positions, xtick_labels
 
@@ -154,7 +226,7 @@ def plot_steps(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize step debug images, predicted x0, and masks.")
+    parser = argparse.ArgumentParser(description="Visualize step debug images, predicted x0, masks, and gradients.")
     parser.add_argument("steps_dir", type=Path, help="Path to steps directory (contains step_*_image.png files).")
     parser.add_argument(
         "--output",
@@ -177,10 +249,18 @@ def main() -> None:
     if not steps_dir.exists():
         raise FileNotFoundError(f"Steps directory not found: {steps_dir}")
 
-    entries, has_x0 = _parse_steps(steps_dir)
+    entries, has_x0, availability = _parse_steps(steps_dir)
     tile_height = _compute_tile_height(entries, args.tile_height, args.max_width)
 
-    rows, xtick_positions, xtick_labels = build_rows(entries, tile_height, include_x0=has_x0)
+    rows, xtick_positions, xtick_labels = build_rows(
+        entries,
+        tile_height,
+        include_x0=has_x0,
+        include_guidance_grad=availability.get("guidance_grad", False),
+        include_tr_grad=availability.get("tr_grad", False),
+        include_guidance_overlay=availability.get("guidance_overlay", False),
+        include_tr_overlay=availability.get("tr_overlay", False),
+    )
 
     output_path = args.output or steps_dir / "steps_overview.png"
     plot_steps(

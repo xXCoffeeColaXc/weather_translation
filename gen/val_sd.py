@@ -78,8 +78,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Device to run inference on (e.g. cuda, cuda:1, cpu). Default picks cuda if available.",
     )
-    parser.add_argument("--height", type=int, default=384)  # 512
-    parser.add_argument("--width", type=int, default=720)  # 512
+    parser.add_argument("--height", type=int, default=512)  # 512
+    parser.add_argument("--width", type=int, default=512)  # 512
     parser.add_argument("--num-inference-steps", type=int, default=30)
     parser.add_argument("--guidance-scale", type=float, default=7.5)
     parser.add_argument(
@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-template",
         type=str,
-        default="autonomous driving scene at {condition}, cinematic, detailed, wet asphalt reflections",
+        default="autonomous driving scene at {condition}, realistic, detailed, road and surroundings visible",
         help="Template for building prompts when --prompts is not provided.",
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for pipeline calls.")

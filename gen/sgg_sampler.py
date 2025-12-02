@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
-
+from termcolor import colored
 from PIL import Image
 from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
 from torch.cuda.amp import autocast as cuda_autocast
@@ -35,30 +35,36 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-OUTDIR = "eval_teacher/benchmark_001"
+OUTDIR = "eval_teacher/benchmark_027"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
-PROMPT = "foggy autonomous driving rural scene, fog effects, blured background"
-NEG = "blurry, cartoon, oversaturated, low detail, distorted cars, night vision, grainy, watermark, text, lens flare halos, blown highlights"
+PROMPT = "foggy autonomous driving rural scene, cars ahead in distance on the road, fog effects, blured background"
+NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors"
 SIZE = (512, 512)
 
 STEPS = 100
-STRENGTH = 0.6  # 850/1000 step of denoising
+STRENGTH = 0.5  # 850/1000 step of denoising
 CFG = 5.0
 
-GUIDE_START, GUIDE_END = 0.0, 1.0
+GUIDE_START, GUIDE_END = 0.0, 0.9
 ETA = 12.0
-TEMPERATURE = 1.00
+TEMPERATURE = 1.5
 GUIDE_BLUR_SIGMA = 0.0
-GUIDE_ALLOWED_CLASSES = [0, 1, 11, 12, 13]  # road, sidewalk, car, person, bicycle
+GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
+                         18]  # road, sidewalk, building, vegetation, terrain, sky, person, rider, car, bycicle
 GUIDE_TV_WEIGHT = 0.01
 
-LAMBDA_TR = 2.0
+LAMBDA_TR = 1.2
 
 GRAD_EPS = 1e-8
-USE_KL = False
-CALLBACK_INTERVAL = 5  # log every N steps
+LOSS_TYPE = "blend"  # "ce" or "kl" or "blend"
+BLEND_WEIGHT = 0.7
+CALLBACK_INTERVAL = 5
+PRED_ON_X0_HAT = False
+MODE = "alternate"  # "gsg" or "lcg" or "alternate"
+GRAD_CLIP_NORM = 2  # e.g., 5.0 to clip by global norm
+GRAD_CLIP_VALUE = None  # e.g., 0.2 to clamp elementwise
 
 
 @dataclass
@@ -78,7 +84,8 @@ class SamplerConfig:
     guide_end: float = GUIDE_END  # fractional progress to end SGG
     eta: float = ETA  #
     lambda_tr: float = LAMBDA_TR  # weight for teacher-relative MSE on latent delta
-    use_kl: bool = USE_KL
+    loss_type: str = LOSS_TYPE  # "ce" or "kl" or "blend"
+    blend_weight: float = BLEND_WEIGHT  # weight for blending KL and CE losses when loss_type is "blend"
     ce_temperature: float = TEMPERATURE
     grad_eps: float = GRAD_EPS
     use_cycle: bool = True  # whether to alternate GSG/LCG/skip cycles
@@ -86,6 +93,10 @@ class SamplerConfig:
     guide_allowed_classes: Optional[list[int]] = field(
         default_factory=lambda: GUIDE_ALLOWED_CLASSES)  # only these class ids are kept for CE; others ignored
     guide_tv_weight: float = GUIDE_TV_WEIGHT  # optional TV penalty on the guided decode
+    grad_clip_norm: Optional[float] = GRAD_CLIP_NORM  # if set, clip gradients by global norm
+    grad_clip_value: Optional[float] = GRAD_CLIP_VALUE  # if set, elementwise clamp gradients
+    pred_on_x0_hat: bool = PRED_ON_X0_HAT  # whether to use x0 prediction in scheduler step (if supported)
+    mode: str = MODE  # "gsg" or "lcg" or "alternate"
 
 
 @dataclass
@@ -97,6 +108,10 @@ class StepOutput:
     decoded_image: torch.Tensor
     decoded_x0_image: torch.Tensor
     predicted_mask: torch.Tensor
+    guidance_heatmap: Optional[torch.Tensor] = None
+    tr_heatmap: Optional[torch.Tensor] = None
+    guidance_overlay: Optional[torch.Tensor] = None
+    tr_overlay: Optional[torch.Tensor] = None
 
 
 def save_01(x01: torch.Tensor, path: Path) -> None:
@@ -214,27 +229,29 @@ def _maybe_apply_sgg(
     torch_dtype: torch.dtype,
     mode: str = "gsg",
     noise_pred: torch.Tensor,
-) -> tuple[torch.Tensor, Optional[float]]:
+) -> tuple[torch.Tensor, Optional[float], Optional[dict[str, torch.Tensor]]]:
     if not (config.guide_start <= progress <= config.guide_end):
         print(" No SGG guidance at this step.")
-        return latents_next.detach().requires_grad_(True), None
+        return latents_next.detach().requires_grad_(True), None, None
 
     #strongest when the image is almost pure noise
     alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
     eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
 
-    # sqrt_alpha_t = alpha_bar_t.sqrt()
-    # sqrt_one_minus_alpha_t = (1 - alpha_bar_t).sqrt()
-
     latents_ori = latents_next.detach()  # teacher/base branch (no grad)
     latents_guided = latents_ori.clone().detach().requires_grad_(True)  # branch we backprop through
 
-    #x0_hat_latents = (latents_guided - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
+    if config.pred_on_x0_hat:
+        sqrt_alpha_t = alpha_bar_t.sqrt()
+        sqrt_one_minus_alpha_t = (1 - alpha_bar_t).sqrt()
+        x0_hat_latents = (latents_guided - sqrt_one_minus_alpha_t * noise_pred.detach()) / sqrt_alpha_t
 
     with _maybe_autocast(device.type, torch_dtype):
-        decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
-        #decoded = pipe.vae.decode(x0_hat_latents / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        if config.pred_on_x0_hat:
+            decoded = pipe.vae.decode(x0_hat_latents / pipe.vae.config.scaling_factor).sample  # [-1,1]
+        else:
+            decoded = pipe.vae.decode(latents_guided / pipe.vae.config.scaling_factor).sample  # [-1,1]
         decoded_01 = (decoded + 1) / 2  # [0,1]
         decoded_01 = decoded_01.clamp(0.0, 1.0)
         if config.guide_blur_sigma > 0:
@@ -244,7 +261,7 @@ def _maybe_apply_sgg(
 
     # Guidance branch selection
     if mode == "lcg":
-        if config.use_kl:
+        if config.loss_type == "kl":
             # LCG with relative KL
             guidance_loss = _lcg_relative_loss(
                 decoded_01,
@@ -253,18 +270,32 @@ def _maybe_apply_sgg(
                 teacher_bundle,
                 temperature=config.ce_temperature,
             )
-        else:
+        elif config.loss_type == "ce":
             # Classic LCG with Cross-Entropy
             guidance_loss = _lcg_loss(
                 decoded_01,
                 mask_for_loss,
                 teacher_bundle,
             )
+        elif config.loss_type == "blend":
+            ce_loss = _lcg_loss(
+                decoded_01,
+                mask_for_loss,
+                teacher_bundle,
+            )
+            kl_loss = _lcg_relative_loss(
+                decoded_01,
+                mask_for_loss,
+                reference_logits,
+                teacher_bundle,
+                temperature=config.ce_temperature,
+            )
+            guidance_loss = config.blend_weight * kl_loss + (1 - config.blend_weight) * ce_loss
         if guidance_loss is None:
             print(" LCG skipped (no valid class pixels); falling back to GSG.")
             guidance_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
     else:
-        if config.use_kl:
+        if config.loss_type == "kl":
             # GSG with relative KL
             guidance_loss = teacher_relative_loss(
                 decoded_01,
@@ -273,37 +304,74 @@ def _maybe_apply_sgg(
                 mask=mask_for_loss,
                 temperature=config.ce_temperature,
             )
-        else:
+        elif config.loss_type == "ce":
             # Classic GSG with Cross-Entropy
             guidance_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+        elif config.loss_type == "blend":
+            ce_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+            kl_loss = teacher_relative_loss(
+                decoded_01,
+                reference_logits,
+                teacher_bundle,
+                mask=mask_for_loss,
+                temperature=config.ce_temperature,
+            )
+            guidance_loss = config.blend_weight * kl_loss + (1 - config.blend_weight) * ce_loss
 
     if config.guide_tv_weight > 0:
         guidance_loss = guidance_loss + config.guide_tv_weight * _total_variation(decoded_01)
 
     # ∇_z L_guidance
     guidance_grad = torch.autograd.grad(guidance_loss, latents_guided, retain_graph=False, create_graph=False)[0]
-    guidance_grad = guidance_grad / (guidance_grad.norm() + config.grad_eps)
+    guidance_grad_used, guidance_norm = _clip_gradient(
+        guidance_grad,
+        max_norm=config.grad_clip_norm,
+        max_value=config.grad_clip_value,
+        eps=config.grad_eps,
+    )
 
     # Update latents_guided semantic gradient (detached)
-    latents_guided_1step = (latents_guided - eta_t * guidance_grad).detach().requires_grad_(True)
+    latents_guided_1step = (latents_guided + eta_t * guidance_grad_used).detach().requires_grad_(True)
 
     # Teacher-relative loss (Compute L_TR = ‖z_guided - z_ori‖²)
     tr_grad = 2 * (latents_guided_1step - latents_ori)  # direct gradient of MSE
-    tr_grad = tr_grad / (tr_grad.norm() + config.grad_eps)
+    tr_grad_used, tr_norm = _clip_gradient(
+        tr_grad,
+        max_norm=config.grad_clip_norm,
+        max_value=config.grad_clip_value,
+        eps=config.grad_eps,
+    )
 
     # Teacher-relative latent penalty to keep SGG near the base SD manifold
-    latents_updated = latents_ori - eta_t * (guidance_grad + config.lambda_tr * tr_grad)
+    latents_updated = latents_ori + eta_t * (guidance_grad_used - config.lambda_tr * tr_grad_used)
 
-    guidance_info = (f"SGG ({mode.upper()}) Loss type={'KL' if config.use_kl else 'CE'}, "
+    guidance_info = (f"SGG ({mode.upper()}) Loss type={config.loss_type}, "
                      f"guidance_loss={guidance_loss.item():.4f}, "
-                     f"MSE_TR={(latents_guided_1step - latents_ori).pow(2).mean().item():.6f}, "
+                     f"mse_loss={(latents_guided_1step - latents_ori).pow(2).mean().item():.6f}, "
                      f"eta_t={eta_t.item():.4f}")
-    norm_info = (f"Norms -> guidance_grad={guidance_grad.norm().item():.4f}, "
-                 f"tr_grad={tr_grad.norm().item():.4f}")
+    norm_info = (f"Norms -> guidance_grad(L2)={guidance_norm:.4f}, "
+                 f"tr_grad(L2)={tr_norm:.4f}, "
+                 f"guidance_grad(max)={guidance_grad_used.abs().max().item():.4f}, "
+                 f"tr_grad(max)={tr_grad_used.abs().max().item():.4f}")
     print(f" {guidance_info}")
     print(f"  {norm_info}")
 
-    return latents_updated.detach().requires_grad_(True), float(guidance_loss.detach().cpu())
+    target_size = tuple(decoded_01.shape[-2:])
+    guidance_heatmap = _gradient_to_heatmap(guidance_grad_used.detach(), target_size=target_size)
+    tr_heatmap = _gradient_to_heatmap(tr_grad_used.detach(), target_size=target_size)
+    guidance_overlay = _overlay_heatmap(decoded_01.detach(), guidance_heatmap)
+    tr_overlay = _overlay_heatmap(decoded_01.detach(), tr_heatmap)
+
+    visuals = {
+        "guidance_heatmap": guidance_heatmap.detach(),
+        "tr_heatmap": tr_heatmap.detach(),
+        "guidance_overlay": guidance_overlay.detach(),
+        "tr_overlay": tr_overlay.detach(),
+        "guidance_grad_norm": guidance_norm,
+        "tr_grad_norm": tr_norm,
+    }
+
+    return latents_updated.detach().requires_grad_(True), float(guidance_loss.detach().cpu()), visuals
 
 
 def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
@@ -317,6 +385,14 @@ def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
         save_01(step.decoded_image, steps_dir / f"{suffix}_image.png")
         save_01(step.decoded_x0_image, steps_dir / f"{suffix}_x0.png")
         mask_to_color(step.predicted_mask[0]).save(steps_dir / f"{suffix}_mask.png")
+        if step.guidance_heatmap is not None:
+            save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
+        if step.tr_heatmap is not None:
+            save_01(step.tr_heatmap, steps_dir / f"{suffix}_tr_grad.png")
+        if step.guidance_overlay is not None:
+            save_01(step.guidance_overlay, steps_dir / f"{suffix}_guidance_overlay.png")
+        if step.tr_overlay is not None:
+            save_01(step.tr_overlay, steps_dir / f"{suffix}_tr_overlay.png")
 
     return _callback
 
@@ -600,6 +676,47 @@ def _total_variation(x: torch.Tensor) -> torch.Tensor:
     return (dx.abs().mean() + dy.abs().mean())
 
 
+def _clip_gradient(grad: torch.Tensor, *, max_norm: Optional[float], max_value: Optional[float],
+                   eps: float) -> tuple[torch.Tensor, float]:
+    """Apply elementwise clamp then global-norm clip (if configured)."""
+    grad_clipped = grad
+    if max_value is not None:
+        grad_clipped = torch.clamp(grad_clipped, min=-max_value, max=max_value)
+    norm = torch.linalg.norm(grad_clipped)
+    if max_norm is not None and norm > max_norm:
+        grad_clipped = grad_clipped * (max_norm / (norm + eps))
+    return grad_clipped, float(norm.detach().cpu())
+
+
+def _grad_magnitude(grad: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return grad.pow(2).sum(dim=1, keepdim=True).add(eps).sqrt()
+
+
+def _colormap(heat: torch.Tensor) -> torch.Tensor:
+    """Simple blue→cyan→yellow→red colormap for single-channel heat in [0,1]."""
+    heat = heat.clamp(0, 1)
+    r = heat
+    g = 1 - (heat - 0.5).abs() * 2  # high in the middle
+    b = 1 - heat
+    return torch.cat([r, g.clamp(0, 1), b], dim=1)
+
+
+def _gradient_to_heatmap(
+    grad: torch.Tensor,
+    *,
+    target_size: tuple[int, int],
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    magnitude = _grad_magnitude(grad, eps=eps)
+    magnitude = magnitude / magnitude.max().clamp_min(eps)
+    heat = F.interpolate(magnitude, size=target_size, mode="bilinear", align_corners=False)
+    return _colormap(heat)
+
+
+def _overlay_heatmap(base: torch.Tensor, heatmap: torch.Tensor, alpha: float = 0.45) -> torch.Tensor:
+    return (1 - alpha) * base + alpha * heatmap
+
+
 def _mask_keep_classes(mask: torch.Tensor, allowed: Optional[list[int]]) -> torch.Tensor:
     if not allowed:
         return mask
@@ -666,7 +783,7 @@ def run_single_sample(
 
     # --- (Optional) reference teacher logits for extra KL stabilization --------
     reference_logits = None
-    if config.use_kl:
+    if config.loss_type in ("kl", "blend"):
         with torch.no_grad():
             reference_logits = compute_teacher_logits(reference_image,
                                                       teacher_bundle,
@@ -682,7 +799,7 @@ def run_single_sample(
 
     # === Main reverse loop: predict noise → scheduler step → (optional) SGG ===
     for step_index, timestep in enumerate(timesteps):
-        print(f" Step {step_index+1}/{steps_to_run} at timestep {timestep}")
+        print(colored(f" Step {step_index+1}/{steps_to_run} at timestep {timestep}", "cyan"))
         # 1) UNet forward with CFG:
         #    duplicate latents for [uncond, cond]; predict eps_uncond, eps_text; mix with cfg.
         latent_input = torch.cat([latents, latents], dim=0)
@@ -698,13 +815,18 @@ def run_single_sample(
         # Progress (0..1) inside the guided window
         progress = step_index / denom
         sgg_loss_value: Optional[float] = None
+        grad_visuals: Optional[dict[str, torch.Tensor]] = None
         guidance_window = (config.guide_start <= progress <= config.guide_end)
         if guidance_window:
             phase = guided_cycle_idx % 2  # 0: GSG, 1: LCG, 2-3: skip
             guided_cycle_idx += 1
             if phase in (0, 1):
-                mode = "gsg" if phase == 0 else "lcg"
-                latents, sgg_loss_value = _maybe_apply_sgg(
+                # mode = "gsg"  # "gsg" if phase == 0 else "lcg"
+                if config.mode == "alternate":
+                    mode = "gsg" if phase == 0 else "lcg"
+                elif config.mode in ("gsg", "lcg"):
+                    mode = config.mode
+                latents, sgg_loss_value, grad_visuals = _maybe_apply_sgg(
                     latents_next,
                     timestep,
                     progress,
@@ -752,6 +874,14 @@ def run_single_sample(
                     decoded_image=decoded_for_log.detach().cpu(),
                     decoded_x0_image=decoded_x0_for_log.detach().cpu(),
                     predicted_mask=predicted_mask.detach().cpu(),
+                    guidance_heatmap=grad_visuals.get("guidance_heatmap").detach().cpu()
+                    if grad_visuals and grad_visuals.get("guidance_heatmap") is not None else None,
+                    tr_heatmap=grad_visuals.get("tr_heatmap").detach().cpu()
+                    if grad_visuals and grad_visuals.get("tr_heatmap") is not None else None,
+                    guidance_overlay=grad_visuals.get("guidance_overlay").detach().cpu()
+                    if grad_visuals and grad_visuals.get("guidance_overlay") is not None else None,
+                    tr_overlay=grad_visuals.get("tr_overlay").detach().cpu()
+                    if grad_visuals and grad_visuals.get("tr_overlay") is not None else None,
                 ))
 
         if verbose and (step_index % max(1, config.steps // 10) == 0):
@@ -782,7 +912,8 @@ def load_finetuned_pipeline(device: torch.device, dtype: torch.dtype) -> StableD
     pipe.safety_checker = None
     pipe.requires_safety_checker = False
 
-    ckpt_dir = Path("gen/checkpoints/sd_lora_finetune_50ep_lora32/final").expanduser().resolve()
+    ckpt_dir = Path(
+        "gen/checkpoints/sd_lora_finetune_100ep_lora128_dyna_maskprompts/step-036000").expanduser().resolve()
 
     text_encoder = _load_component_if_exists(CLIPTextModel, ckpt_dir / "text_encoder", dtype=dtype)
     if text_encoder is not None:
