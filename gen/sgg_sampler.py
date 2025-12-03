@@ -36,20 +36,21 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-OUTDIR = "eval_city/benchmark_inversion_001"
+OUTDIR = "eval_city/benchmark_inversion_09_no_gsg_gated"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
+# PROMPT = "urban driving scene during rain, realistic and detailed with visible vehicles."
 PROMPT = "autonomous driving scene at rain, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
 NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors"
 SIZE = (512, 512)
 
 STEPS = 100
-STRENGTH = 0.5  # 850/1000 step of denoising
+STRENGTH = 0.5
 CFG = 7.5
 
-GUIDE_START, GUIDE_END = 2.0, 2.0
-GUIDE_LAMBDA = 15.0
+GUIDE_START, GUIDE_END = 2.0, 1.0
+GUIDE_LAMBDA = 10.0
 GUIDE_BLUR_SIGMA = 0.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
                          18]  # road, sidewalk, building, vegetation, terrain, sky, rider, car, bycicle
@@ -74,9 +75,9 @@ GRAD_EPS = 1e-8
 LOSS_TYPE = "ce"  # "ce" or "kl" or "blend"
 BLEND_WEIGHT = 0.9
 CALLBACK_INTERVAL = 5
-PRED_ON_X0_HAT = False
+PRED_ON_X0_HAT = True
 MODE = "alternate"  # "gsg" or "lcg" or "alternate"
-GRAD_CLIP_NORM = 5  # e.g., 5.0 to clip by global norm
+GRAD_CLIP_NORM = 4  # e.g., 5.0 to clip by global norm
 GRAD_CLIP_VALUE = None  # e.g., 0.2 to clamp elementwise
 
 
@@ -124,6 +125,7 @@ class StepOutput:
     decoded_image: torch.Tensor
     decoded_x0_image: torch.Tensor
     predicted_mask: torch.Tensor
+    predicted_mask_x0: torch.Tensor
     guidance_heatmap: Optional[torch.Tensor] = None
     tr_heatmap: Optional[torch.Tensor] = None
     guidance_overlay: Optional[torch.Tensor] = None
@@ -419,6 +421,7 @@ def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
         save_01(step.decoded_image, steps_dir / f"{suffix}_image.png")
         save_01(step.decoded_x0_image, steps_dir / f"{suffix}_x0.png")
         mask_to_color(step.predicted_mask[0]).save(steps_dir / f"{suffix}_mask.png")
+        mask_to_color(step.predicted_mask_x0[0]).save(steps_dir / f"{suffix}_mask_x0.png")
         if step.guidance_heatmap is not None:
             save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
         if step.tr_heatmap is not None:
@@ -856,19 +859,21 @@ def invert(
     latents,
     device,
     torch_dtype,
-    guidance_scale=3,
+    guidance_scale=CFG,
     num_inference_steps=STEPS,
     do_classifier_free_guidance=True,
 ):
+    # change prompt to be sunny:
+    SUNNY_PROMPT = PROMPT.replace("rain", "sunny clear day")
     prompt_tokens = pipe.tokenizer(
-        "Autonomous driving in sunny weather",
+        SUNNY_PROMPT,
         padding="max_length",
         max_length=pipe.tokenizer.model_max_length,
         truncation=True,
         return_tensors="pt",
     )
     negative_tokens = pipe.tokenizer(
-        "",
+        NEG,
         padding="max_length",
         max_length=pipe.tokenizer.model_max_length,
         truncation=True,
@@ -949,17 +954,25 @@ def run_single_sample(
     else:
         init_latents = _encode_init_latents(pipe, image_pil, device=device, torch_dtype=torch_dtype)
         inversion_steps = int(config.steps)
-        inverted_latents = invert(pipe, init_latents, device, torch_dtype, num_inference_steps=inversion_steps)
+        inverted_latents = invert(pipe,
+                                  init_latents,
+                                  device,
+                                  torch_dtype,
+                                  num_inference_steps=inversion_steps,
+                                  do_classifier_free_guidance=True)
         torch.save(inverted_latents, inverted_latents_path)
 
     # Rebuild the timestep schedule here (invert mutates the scheduler), and make sure
     # we only index into available inverted latents.
     timesteps, t_start_idx = _build_timesteps(pipe.scheduler, config, device=device, verbose=verbose)
+    print(f"Start index: {t_start_idx}")
     max_available_idx = inverted_latents.shape[0] - 1
     if t_start_idx > max_available_idx:
         if verbose:
-            print(colored(f"Clamping start index from {t_start_idx} to {max_available_idx} "
-                          f"to match inverted latents.", "yellow"))
+            print(
+                colored(
+                    f"Clamping start index from {t_start_idx} to {max_available_idx} "
+                    f"to match inverted latents.", "yellow"))
         t_start_idx = max_available_idx
     latents = inverted_latents[-(t_start_idx + 1)][None]
 
@@ -979,6 +992,13 @@ def run_single_sample(
         1, steps_to_run)
     guided_cycle_idx = 0
 
+    protected = {11: 0.1, 12: 0.1, 13: 0.1}  # person, rider, car; tune as needed
+    weights = torch.ones_like(mask_batch, dtype=torch.float32, device=mask_batch.device)
+    for cls, w in protected.items():
+        weights = torch.where(mask_batch == cls, w, weights)
+
+    weights_latent = F.interpolate(weights.unsqueeze(1), size=latents.shape[-2:], mode="nearest")
+
     # === Main reverse loop: predict noise → scheduler step → (optional) SGG ===
     for step_index, timestep in enumerate(timesteps):
         print(colored(f" Step {step_index+1}/{steps_to_run} at timestep {timestep}", "cyan"))
@@ -989,7 +1009,7 @@ def run_single_sample(
         with _maybe_autocast(device.type, torch_dtype):
             noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
             noise_uncond, noise_text = noise_pred.chunk(2)
-            noise_pred = noise_uncond + config.cfg * (noise_text - noise_uncond)
+            noise_pred = noise_uncond + (config.cfg * weights_latent) * (noise_text - noise_uncond)
             noise_pred_for_sgg = noise_pred.detach()
 
         latents_next, pred_original_latents = _scheduler_step_with_x0(pipe.scheduler, latents, timestep, noise_pred)
@@ -1045,6 +1065,11 @@ def run_single_sample(
                 torch_dtype=torch_dtype,
             )
             predicted_mask = predict_mask_from_image(decoded_for_log, teacher_bundle, target_size=mask_batch.shape[-2:])
+            # replace the predicted_mask line
+            predicted_mask_x0 = predict_mask_from_image(decoded_x0_for_log,
+                                                        teacher_bundle,
+                                                        target_size=mask_batch.shape[-2:])
+
             timestep_value = int(timestep.detach().cpu().item()) if isinstance(timestep,
                                                                                torch.Tensor) else int(timestep)
             step_callback(
@@ -1056,6 +1081,7 @@ def run_single_sample(
                     decoded_image=decoded_for_log.detach().cpu(),
                     decoded_x0_image=decoded_x0_for_log.detach().cpu(),
                     predicted_mask=predicted_mask.detach().cpu(),
+                    predicted_mask_x0=predicted_mask_x0.detach().cpu(),
                     guidance_heatmap=grad_visuals.get("guidance_heatmap").detach().cpu()
                     if grad_visuals and grad_visuals.get("guidance_heatmap") is not None else None,
                     tr_heatmap=grad_visuals.get("tr_heatmap").detach().cpu()

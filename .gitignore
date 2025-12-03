@@ -19,3 +19,4 @@ data/*
 /gen_ddpm/checkpoints
 /gen_ddpm/ddpm_sgg_samples
 /srgan_model/weights
+*.pt
