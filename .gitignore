@@ -15,6 +15,7 @@ data/*
 /eval
 /eval_kl
 /eval_teacher
+/eval_city
 /gen_ddpm/checkpoints
 /gen_ddpm/ddpm_sgg_samples
 /srgan_model/weights

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from dotenv import load_dotenv
+import tqdm
 
 load_dotenv()
 
@@ -35,35 +36,47 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-OUTDIR = "eval_teacher/benchmark_027"
+OUTDIR = "eval_city/benchmark_inversion_001"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
-PROMPT = "foggy autonomous driving rural scene, cars ahead in distance on the road, fog effects, blured background"
+PROMPT = "autonomous driving scene at rain, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
 NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors"
 SIZE = (512, 512)
 
 STEPS = 100
 STRENGTH = 0.5  # 850/1000 step of denoising
-CFG = 5.0
+CFG = 7.5
 
-GUIDE_START, GUIDE_END = 0.0, 0.9
-ETA = 12.0
-TEMPERATURE = 1.5
+GUIDE_START, GUIDE_END = 2.0, 2.0
+GUIDE_LAMBDA = 15.0
 GUIDE_BLUR_SIGMA = 0.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
-                         18]  # road, sidewalk, building, vegetation, terrain, sky, person, rider, car, bycicle
+                         18]  # road, sidewalk, building, vegetation, terrain, sky, rider, car, bycicle
+GUIDE_CLASS_WEIGHTS = {
+    13: 3.0,  # car
+    0: 2.0,  # road
+    2: 1.0,  # building
+    1: 1.0,  # sidewalk
+    8: 1.0,  # vegetation
+    9: 1.0,  # terrain
+    10: 1.0,  # sky
+    11: 0.5,  # person
+    12: 0.5,  # rider
+    18: 0.5,  # bicycle
+}
 GUIDE_TV_WEIGHT = 0.01
 
-LAMBDA_TR = 1.2
+TEMPERATURE = 1.0
+LAMBDA_TR = 0.25
 
 GRAD_EPS = 1e-8
-LOSS_TYPE = "blend"  # "ce" or "kl" or "blend"
-BLEND_WEIGHT = 0.7
+LOSS_TYPE = "ce"  # "ce" or "kl" or "blend"
+BLEND_WEIGHT = 0.9
 CALLBACK_INTERVAL = 5
 PRED_ON_X0_HAT = False
 MODE = "alternate"  # "gsg" or "lcg" or "alternate"
-GRAD_CLIP_NORM = 2  # e.g., 5.0 to clip by global norm
+GRAD_CLIP_NORM = 5  # e.g., 5.0 to clip by global norm
 GRAD_CLIP_VALUE = None  # e.g., 0.2 to clamp elementwise
 
 
@@ -82,7 +95,7 @@ class SamplerConfig:
     cfg: float = CFG  # classifier-free guidance scale
     guide_start: float = GUIDE_START  # fractional progress to start SGG
     guide_end: float = GUIDE_END  # fractional progress to end SGG
-    eta: float = ETA  #
+    guide_lambda: float = GUIDE_LAMBDA  #
     lambda_tr: float = LAMBDA_TR  # weight for teacher-relative MSE on latent delta
     loss_type: str = LOSS_TYPE  # "ce" or "kl" or "blend"
     blend_weight: float = BLEND_WEIGHT  # weight for blending KL and CE losses when loss_type is "blend"
@@ -97,6 +110,9 @@ class SamplerConfig:
     grad_clip_value: Optional[float] = GRAD_CLIP_VALUE  # if set, elementwise clamp gradients
     pred_on_x0_hat: bool = PRED_ON_X0_HAT  # whether to use x0 prediction in scheduler step (if supported)
     mode: str = MODE  # "gsg" or "lcg" or "alternate"
+    # Class weighting for CE/KL guidance (trainIds). Defaults: car > road > building; others 0 (ignored).
+    class_weights: Optional[dict[int, float]] = field(default_factory=lambda: GUIDE_CLASS_WEIGHTS)
+    inverted_latents_path: Optional[str] = "munster_000009_000019_leftImg8bit_inverted_latents.pt"
 
 
 @dataclass
@@ -232,12 +248,12 @@ def _maybe_apply_sgg(
 ) -> tuple[torch.Tensor, Optional[float], Optional[dict[str, torch.Tensor]]]:
     if not (config.guide_start <= progress <= config.guide_end):
         print(" No SGG guidance at this step.")
-        return latents_next.detach().requires_grad_(True), None, None
+        return latents_next.detach(), None, None
 
     #strongest when the image is almost pure noise
     alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
-    eta_t = config.eta * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
+    guide_lambda_t = config.guide_lambda * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
 
     latents_ori = latents_next.detach()  # teacher/base branch (no grad)
     latents_guided = latents_ori.clone().detach().requires_grad_(True)  # branch we backprop through
@@ -269,6 +285,7 @@ def _maybe_apply_sgg(
                 reference_logits,
                 teacher_bundle,
                 temperature=config.ce_temperature,
+                class_weights=config.class_weights,
             )
         elif config.loss_type == "ce":
             # Classic LCG with Cross-Entropy
@@ -276,12 +293,14 @@ def _maybe_apply_sgg(
                 decoded_01,
                 mask_for_loss,
                 teacher_bundle,
+                class_weights=config.class_weights,
             )
         elif config.loss_type == "blend":
             ce_loss = _lcg_loss(
                 decoded_01,
                 mask_for_loss,
                 teacher_bundle,
+                class_weights=config.class_weights,
             )
             kl_loss = _lcg_relative_loss(
                 decoded_01,
@@ -289,11 +308,16 @@ def _maybe_apply_sgg(
                 reference_logits,
                 teacher_bundle,
                 temperature=config.ce_temperature,
+                class_weights=config.class_weights,
             )
             guidance_loss = config.blend_weight * kl_loss + (1 - config.blend_weight) * ce_loss
         if guidance_loss is None:
             print(" LCG skipped (no valid class pixels); falling back to GSG.")
-            guidance_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+            guidance_loss = ce_label(decoded_01,
+                                     mask_for_loss,
+                                     teacher_bundle,
+                                     temperature=config.ce_temperature,
+                                     class_weights=config.class_weights)
     else:
         if config.loss_type == "kl":
             # GSG with relative KL
@@ -303,18 +327,28 @@ def _maybe_apply_sgg(
                 teacher_bundle,
                 mask=mask_for_loss,
                 temperature=config.ce_temperature,
+                class_weights=config.class_weights,
             )
         elif config.loss_type == "ce":
             # Classic GSG with Cross-Entropy
-            guidance_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+            guidance_loss = ce_label(decoded_01,
+                                     mask_for_loss,
+                                     teacher_bundle,
+                                     temperature=config.ce_temperature,
+                                     class_weights=config.class_weights)
         elif config.loss_type == "blend":
-            ce_loss = ce_label(decoded_01, mask_for_loss, teacher_bundle, temperature=config.ce_temperature)
+            ce_loss = ce_label(decoded_01,
+                               mask_for_loss,
+                               teacher_bundle,
+                               temperature=config.ce_temperature,
+                               class_weights=config.class_weights)
             kl_loss = teacher_relative_loss(
                 decoded_01,
                 reference_logits,
                 teacher_bundle,
                 mask=mask_for_loss,
                 temperature=config.ce_temperature,
+                class_weights=config.class_weights,
             )
             guidance_loss = config.blend_weight * kl_loss + (1 - config.blend_weight) * ce_loss
 
@@ -330,8 +364,8 @@ def _maybe_apply_sgg(
         eps=config.grad_eps,
     )
 
-    # Update latents_guided semantic gradient (detached)
-    latents_guided_1step = (latents_guided + eta_t * guidance_grad_used).detach().requires_grad_(True)
+    # Update latents_guided semantic gradient (detached). No grad needed beyond this point.
+    latents_guided_1step = (latents_guided - guide_lambda_t * guidance_grad_used).detach()
 
     # Teacher-relative loss (Compute L_TR = ‖z_guided - z_ori‖²)
     tr_grad = 2 * (latents_guided_1step - latents_ori)  # direct gradient of MSE
@@ -343,12 +377,12 @@ def _maybe_apply_sgg(
     )
 
     # Teacher-relative latent penalty to keep SGG near the base SD manifold
-    latents_updated = latents_ori + eta_t * (guidance_grad_used - config.lambda_tr * tr_grad_used)
+    latents_updated = latents_ori - guide_lambda_t * (guidance_grad_used + config.lambda_tr * tr_grad_used)
 
     guidance_info = (f"SGG ({mode.upper()}) Loss type={config.loss_type}, "
                      f"guidance_loss={guidance_loss.item():.4f}, "
                      f"mse_loss={(latents_guided_1step - latents_ori).pow(2).mean().item():.6f}, "
-                     f"eta_t={eta_t.item():.4f}")
+                     f"guide_lambda_t={guide_lambda_t.item():.4f}")
     norm_info = (f"Norms -> guidance_grad(L2)={guidance_norm:.4f}, "
                  f"tr_grad(L2)={tr_norm:.4f}, "
                  f"guidance_grad(max)={guidance_grad_used.abs().max().item():.4f}, "
@@ -371,7 +405,7 @@ def _maybe_apply_sgg(
         "tr_grad_norm": tr_norm,
     }
 
-    return latents_updated.detach().requires_grad_(True), float(guidance_loss.detach().cpu()), visuals
+    return latents_updated.detach(), float(guidance_loss.detach().cpu()), visuals
 
 
 def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
@@ -518,6 +552,7 @@ def ce_label(
     mask: torch.Tensor,
     bundle: ModelBundle,
     temperature: float = 1.0,
+    class_weights: Optional[dict[int, float]] = None,
 ) -> torch.Tensor:
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
@@ -525,7 +560,14 @@ def ce_label(
     target = mask.to(device=logits.device, dtype=torch.long)
     if temperature != 1.0:
         logits = logits / temperature
-    return F.cross_entropy(logits, target, ignore_index=IGNORE_LABEL)
+    if class_weights is None:
+        return F.cross_entropy(logits, target, ignore_index=IGNORE_LABEL)
+    loss_map = F.cross_entropy(logits, target, ignore_index=IGNORE_LABEL, reduction="none")
+    weights = _pixel_weight_map(target, class_weights).to(device=logits.device, dtype=logits.dtype)
+    valid = target != IGNORE_LABEL
+    weighted = loss_map * weights
+    denom = weights[valid].sum().clamp_min(1e-6)
+    return weighted[valid].sum() / denom
 
 
 def kl_logits(
@@ -546,6 +588,7 @@ def _lcg_relative_loss(
     teacher_bundle: ModelBundle,
     *,
     temperature: float = 1.0,
+    class_weights: Optional[dict[int, float]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Label-conditional *relative* guidance:
@@ -583,10 +626,14 @@ def _lcg_relative_loss(
         return None
 
     per_class_losses = []
+    per_class_weights = []
     for cls in classes:
         # select pixels of this class
         region_mask = (mask_flat == cls)
         if not region_mask.any():
+            continue
+        weight = _class_weight_value(int(cls.item()), class_weights)
+        if weight == 0.0:
             continue
         cand_lp_region = cand_log_probs_flat[region_mask]  # [N_c, C]
         ref_p_region = ref_probs_flat[region_mask]  # [N_c, C]
@@ -598,12 +645,16 @@ def _lcg_relative_loss(
             reduction="batchmean",
         )
         per_class_losses.append(kl_c)
+        per_class_weights.append(weight)
 
-    if not per_class_losses:
+    if not per_class_losses or not per_class_weights:
         return None
 
-    # Equal weight per class
-    return torch.stack(per_class_losses).mean()
+    losses = torch.stack(per_class_losses)
+    if class_weights is None:
+        return losses.mean()
+    weight_tensor = torch.as_tensor(per_class_weights, device=losses.device, dtype=losses.dtype)
+    return (losses * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
 
 
 def teacher_relative_loss(
@@ -613,6 +664,7 @@ def teacher_relative_loss(
     *,
     mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
+    class_weights: Optional[dict[int, float]] = None,
 ) -> torch.Tensor:
     """
     Relative teacher loss: per-pixel KL( p_ref || p_cur ) between
@@ -645,13 +697,17 @@ def teacher_relative_loss(
     kl_map = kl_map.sum(dim=1)  # [B, H, W]
 
     if mask is not None:
-        # Restrict to valid pixels (and optionally allowed classes)
+        # Restrict to valid pixels (and optionally apply class weights)
         valid = (mask != IGNORE_LABEL).to(device=device)  # [B, H, W]
-        kl_map = kl_map * valid
-        denom = valid.float().sum().clamp_min(1.0)
-        return kl_map.sum() / denom
-    else:
-        return kl_map.mean()
+        if class_weights is None:
+            kl_map = kl_map * valid
+            denom = valid.float().sum().clamp_min(1.0)
+            return kl_map.sum() / denom
+        weights = _pixel_weight_map(mask.to(device=device), class_weights).to(device=device, dtype=kl_map.dtype)
+        weighted = kl_map * weights
+        denom = (weights * valid).sum().clamp_min(1e-6)
+        return weighted.sum() / denom
+    return kl_map.mean()
 
 
 def _gaussian_blur(image: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -727,10 +783,35 @@ def _mask_keep_classes(mask: torch.Tensor, allowed: Optional[list[int]]) -> torc
     return masked
 
 
+def _class_weight_value(cls: int, class_weights: Optional[dict[int, float]]) -> float:
+    if class_weights is None:
+        return 1.0
+    return float(class_weights.get(int(cls), 0.0))
+
+
+def _pixel_weight_map(mask: torch.Tensor, class_weights: Optional[dict[int, float]]) -> torch.Tensor:
+    """
+    Build a per-pixel weight map from class IDs. Defaults to all ones when no weights are given.
+    """
+    device = mask.device
+    dtype = torch.float32 if not mask.is_floating_point() else mask.dtype
+    if class_weights is None:
+        return torch.ones_like(mask, dtype=dtype, device=device)
+    weights = torch.zeros_like(mask, dtype=dtype, device=device)
+    for cls, value in class_weights.items():
+        if value == 0:
+            continue
+        weights = torch.where(mask == int(cls), torch.as_tensor(float(value), device=device, dtype=dtype), weights)
+    weights = torch.where(mask == IGNORE_LABEL, torch.zeros((), device=device, dtype=dtype), weights)
+    return weights
+
+
 def _lcg_loss(
     decoded_01: torch.Tensor,
     mask_batch: torch.Tensor,
     teacher_bundle: ModelBundle,
+    *,
+    class_weights: Optional[dict[int, float]] = None,
 ) -> Optional[torch.Tensor]:
     """
     Label-conditional guidance: compute per-class NLL over each present class region, average across classes.
@@ -745,18 +826,104 @@ def _lcg_loss(
         return None
 
     per_class_losses = []
+    per_class_weights = []
     for cls in classes:
         region_mask = (mask_batch == cls)
         if not region_mask.any():
             continue
         # Only penalise pixels belonging to this class
         nll = -log_probs[:, cls][region_mask]
+        weight = _class_weight_value(int(cls.item()), class_weights)
+        if weight == 0.0:
+            continue
         per_class_losses.append(nll.mean())
+        per_class_weights.append(weight)
 
-    if not per_class_losses:
+    if not per_class_losses or not per_class_weights:
         return None
 
-    return torch.stack(per_class_losses).mean()
+    losses = torch.stack(per_class_losses)
+    if class_weights is None:
+        return losses.mean()
+    weight_tensor = torch.as_tensor(per_class_weights, device=losses.device, dtype=losses.dtype)
+    return (losses * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
+
+
+## Inversion
+@torch.no_grad()
+def invert(
+    pipe,
+    latents,
+    device,
+    torch_dtype,
+    guidance_scale=3,
+    num_inference_steps=STEPS,
+    do_classifier_free_guidance=True,
+):
+    prompt_tokens = pipe.tokenizer(
+        "Autonomous driving in sunny weather",
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    negative_tokens = pipe.tokenizer(
+        "",
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        with _maybe_autocast(device.type, torch_dtype):
+            pos_embeds = pipe.text_encoder(prompt_tokens.input_ids.to(device))[0]
+            neg_embeds = pipe.text_encoder(negative_tokens.input_ids.to(device))[0]
+    text_embeddings = torch.cat([neg_embeds, pos_embeds], dim=0)
+
+    # We'll keep a list of the inverted latents as the process goes on
+    intermediate_latents = []
+
+    # Set num inference steps
+    pipe.scheduler.set_timesteps(num_inference_steps, device=device)
+
+    # Reversed timesteps <<<<<<<<<<<<<<<<<<<<
+    timesteps = reversed(pipe.scheduler.timesteps)
+
+    for i in tqdm.tqdm(range(1, num_inference_steps), total=num_inference_steps - 1):
+
+        # We'll skip the final iteration
+        if i >= num_inference_steps - 1:
+            continue
+
+        t = timesteps[i]
+
+        # Expand the latents if we are doing classifier free guidance
+        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
+
+        # Predict the noise residual
+        with _maybe_autocast(device.type, torch_dtype):
+            noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+
+        # Perform guidance
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        current_t = max(0, t.item() - (1000 // num_inference_steps))  # t
+        next_t = t  # min(999, t.item() + (1000//num_inference_steps)) # t+1
+        alpha_t = pipe.scheduler.alphas_cumprod[current_t]
+        alpha_t_next = pipe.scheduler.alphas_cumprod[next_t]
+
+        # Inverted update step (re-arranging the update step to get x(t) (new latents) as a function of x(t-1) (current latents)
+        latents = (latents -
+                   (1 - alpha_t).sqrt() * noise_pred) * (alpha_t_next.sqrt() /
+                                                         alpha_t.sqrt()) + (1 - alpha_t_next).sqrt() * noise_pred
+
+        # Store
+        intermediate_latents.append(latents)
+
+    return torch.cat(intermediate_latents)
 
 
 def run_single_sample(
@@ -774,12 +941,27 @@ def run_single_sample(
     step_callback: Optional[Callable[[StepOutput], None]] = None,
     verbose: bool = True,
 ) -> tuple[torch.Tensor, list[float]]:
-    init_latents = _encode_init_latents(pipe, image_pil, device=device, torch_dtype=torch_dtype)
 
-    # --- Build the reverse-time schedule and inject SDEdit noise --------------
-    timesteps, _ = _build_timesteps(pipe.scheduler, config, device=device, verbose=verbose)
-    timestep = timesteps[0]
-    latents = _add_noise(pipe.scheduler, init_latents, timestep, verbose=verbose).detach().requires_grad_(True)
+    inverted_latents_path = Path(config.inverted_latents_path)
+
+    if inverted_latents_path.exists():
+        inverted_latents = torch.load(inverted_latents_path, map_location=device)
+    else:
+        init_latents = _encode_init_latents(pipe, image_pil, device=device, torch_dtype=torch_dtype)
+        inversion_steps = int(config.steps)
+        inverted_latents = invert(pipe, init_latents, device, torch_dtype, num_inference_steps=inversion_steps)
+        torch.save(inverted_latents, inverted_latents_path)
+
+    # Rebuild the timestep schedule here (invert mutates the scheduler), and make sure
+    # we only index into available inverted latents.
+    timesteps, t_start_idx = _build_timesteps(pipe.scheduler, config, device=device, verbose=verbose)
+    max_available_idx = inverted_latents.shape[0] - 1
+    if t_start_idx > max_available_idx:
+        if verbose:
+            print(colored(f"Clamping start index from {t_start_idx} to {max_available_idx} "
+                          f"to match inverted latents.", "yellow"))
+        t_start_idx = max_available_idx
+    latents = inverted_latents[-(t_start_idx + 1)][None]
 
     # --- (Optional) reference teacher logits for extra KL stabilization --------
     reference_logits = None
@@ -843,10 +1025,10 @@ def run_single_sample(
                 # print(f" Applied SGG ({mode.upper()}) this step; loss={sgg_loss_value:.4f}")
             else:
                 print(" Guidance window active but skipping SGG this step.")
-                latents = latents_next.detach().requires_grad_(True)
+                latents = latents_next.detach()
         else:
             print(" No SGG guidance at this step.")
-            latents = latents_next.detach().requires_grad_(True)
+            latents = latents_next.detach()
 
         if sgg_loss_value is not None:
             sgg_loss_log.append(sgg_loss_value)
@@ -964,8 +1146,8 @@ def main(
     out_dir: str | Path = OUTDIR,
     *,
     teacher_model: str = TEACHER_MODEL,
-    max_samples: Optional[int] = 2,
-    num_workers: int = 8,
+    max_samples: Optional[int] = 3,
+    num_workers: int = 1,
     seed: Optional[int] = 42,
     config: Optional[SamplerConfig] = None,
     callback_interval: Optional[int] = CALLBACK_INTERVAL,
@@ -996,18 +1178,19 @@ def main(
     except Exception as exc:  # pragma: no cover - optional accel
         print(f"Could not enable xformers attention: {exc}")
 
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-
-    # from diffusers import DPMSolverMultistepScheduler
-    # use_karras = sampler_config.use_karras_sigmas and not sampler_config.full_denoise_from_start
-    # pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-    #     pipe.scheduler.config,
-    #     algorithm_type="dpmsolver++",  # smaller noise jumps
-    #     use_karras_sigmas=use_karras,  # disable if using custom contiguous timesteps
-    #     timestep_spacing=sampler_config.timestep_spacing,  # trailing/leading/linspace
-    #     rescale_betas_zero_snr=True,  # flattens SNR so early steps are less destructive
-    # )
-    # pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if not sampler_config.full_denoise_from_start:
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+    else:
+        from diffusers import DPMSolverMultistepScheduler
+        use_karras = sampler_config.use_karras_sigmas and not sampler_config.full_denoise_from_start
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            algorithm_type="dpmsolver++",  # smaller noise jumps
+            use_karras_sigmas=use_karras,  # disable if using custom contiguous timesteps
+            timestep_spacing=sampler_config.timestep_spacing,  # trailing/leading/linspace
+            rescale_betas_zero_snr=True,  # flattens SNR so early steps are less destructive
+        )
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 
     pipe.enable_attention_slicing()  # chunk attention to reduce peak memory
     pipe.enable_vae_slicing()  # decode in slices to save VRAM
@@ -1053,7 +1236,7 @@ def main(
         if idx >= total_steps:
             break
 
-        if idx != 1:
+        if idx != 2:
             continue
 
         sample_info = dataset.samples[idx]
