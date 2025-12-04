@@ -35,13 +35,13 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
-
-OUTDIR = "eval_city/benchmark_inversion_09_no_gsg_gated"
+OUTDIR = "eval_city/benchmark_inversion_09_gsg_gated_fog7"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
 # PROMPT = "urban driving scene during rain, realistic and detailed with visible vehicles."
-PROMPT = "autonomous driving scene at rain, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
+#PROMPT = "autonomous driving scene at fog, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
+PROMPT = "autonomous driving scene at fog, realistic, detailed, road and surroundings visible. Scene contains vegetation, car in a rural setting"
 NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors"
 SIZE = (512, 512)
 
@@ -49,7 +49,7 @@ STEPS = 100
 STRENGTH = 0.5
 CFG = 7.5
 
-GUIDE_START, GUIDE_END = 2.0, 1.0
+GUIDE_START, GUIDE_END = 0.0, 1.0
 GUIDE_LAMBDA = 10.0
 GUIDE_BLUR_SIGMA = 0.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
@@ -71,9 +71,15 @@ GUIDE_TV_WEIGHT = 0.01
 TEMPERATURE = 1.0
 LAMBDA_TR = 0.25
 
+PROTECTED_CLASSES = {
+    11: 0.1,  # person,
+    12: 0.1,  # rider
+    13: 0.1,  # car
+}
+
 GRAD_EPS = 1e-8
 LOSS_TYPE = "ce"  # "ce" or "kl" or "blend"
-BLEND_WEIGHT = 0.9
+BLEND_WEIGHT = 0.7
 CALLBACK_INTERVAL = 5
 PRED_ON_X0_HAT = True
 MODE = "alternate"  # "gsg" or "lcg" or "alternate"
@@ -113,7 +119,8 @@ class SamplerConfig:
     mode: str = MODE  # "gsg" or "lcg" or "alternate"
     # Class weighting for CE/KL guidance (trainIds). Defaults: car > road > building; others 0 (ignored).
     class_weights: Optional[dict[int, float]] = field(default_factory=lambda: GUIDE_CLASS_WEIGHTS)
-    inverted_latents_path: Optional[str] = "munster_000009_000019_leftImg8bit_inverted_latents.pt"
+    inverted_latents_path: Optional[str] = "lindau_000058_000019_leftImg8bit_inverted_latents.pt"
+    protected_classes: Optional[dict[int, float]] = field(default_factory=lambda: PROTECTED_CLASSES)
 
 
 @dataclass
@@ -864,7 +871,7 @@ def invert(
     do_classifier_free_guidance=True,
 ):
     # change prompt to be sunny:
-    SUNNY_PROMPT = PROMPT.replace("rain", "sunny clear day")
+    SUNNY_PROMPT = PROMPT.replace("fog", "sunny clear day")
     prompt_tokens = pipe.tokenizer(
         SUNNY_PROMPT,
         padding="max_length",
@@ -992,9 +999,8 @@ def run_single_sample(
         1, steps_to_run)
     guided_cycle_idx = 0
 
-    protected = {11: 0.1, 12: 0.1, 13: 0.1}  # person, rider, car; tune as needed
     weights = torch.ones_like(mask_batch, dtype=torch.float32, device=mask_batch.device)
-    for cls, w in protected.items():
+    for cls, w in config.protected_classes.items():
         weights = torch.where(mask_batch == cls, w, weights)
 
     weights_latent = F.interpolate(weights.unsqueeze(1), size=latents.shape[-2:], mode="nearest")
@@ -1262,7 +1268,7 @@ def main(
         if idx >= total_steps:
             break
 
-        if idx != 2:
+        if idx != 1:
             continue
 
         sample_info = dataset.samples[idx]
