@@ -19,6 +19,7 @@ class LinearNoiseScheduler:
         self.sqrt_alpha_cum_prod = torch.sqrt(self.alpha_cum_prod)
         self.one_minus_cum_prod = 1 - self.alpha_cum_prod
         self.sqrt_one_minus_alpha_cum_prod = torch.sqrt(1 - self.alpha_cum_prod)
+        self.max_sigma = self.sqrt_one_minus_alpha_cum_prod.max()
 
         self.betas = self.betas.to(device)
         self.alphas = self.alphas.to(device)
@@ -26,13 +27,18 @@ class LinearNoiseScheduler:
         self.sqrt_alpha_cum_prod = self.sqrt_alpha_cum_prod.to(device)
         self.one_minus_cum_prod = self.one_minus_cum_prod.to(device)
         self.sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod.to(device)
+        self.max_sigma = self.max_sigma.to(device)
 
     def add_noise2(self, original, noise, t):
-        sqrt_alpha_cum_prod = self.sqrt_alpha_cum_prod.to(device)[t].reshape(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod.to(device)[t].reshape(-1, 1, 1, 1)
+        device = original.device
+        sqrt_alpha_cum_prod = self.sqrt_alpha_cum_prod.to(device)[t]
+        sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod.to(device)[t]
 
-        noise_image = sqrt_alpha_cum_prod * original + sqrt_one_minus_alpha_cum_prod * noise
-        return noise_image
+        view_shape = (-1,) + (1,) * (original.dim() - 1)
+        sqrt_alpha_cum_prod = sqrt_alpha_cum_prod.view(view_shape)
+        sqrt_one_minus_alpha_cum_prod = sqrt_one_minus_alpha_cum_prod.view(view_shape)
+
+        return sqrt_alpha_cum_prod * original + sqrt_one_minus_alpha_cum_prod * noise
 
     def add_noise(self, original, noise, t):
         r"""
@@ -55,26 +61,28 @@ class LinearNoiseScheduler:
             sqrt_one_minus_alpha_cum_prod = sqrt_one_minus_alpha_cum_prod.unsqueeze(-1)
 
         # Apply and Return Forward process equation
-        return (
-            sqrt_alpha_cum_prod.to(original.device) * original +
-            sqrt_one_minus_alpha_cum_prod.to(original.device) * noise
-        )
+        return (sqrt_alpha_cum_prod.to(original.device) * original +
+                sqrt_one_minus_alpha_cum_prod.to(original.device) * noise)
 
-    def sample_prev_timestep2(self, xt, noise_pred, t):
-        beta = self.betas[t].view(-1, 1, 1, 1)
-        alpha = self.alphas[t].view(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod[t].view(-1, 1, 1, 1)
+    def sample_prev_timestep2(self, xt, noise_pred, t) -> tuple[torch.Tensor, torch.Tensor]:
+        device = xt.device
+        beta = self.betas.to(device)[t].view(-1, 1, 1, 1)
+        alpha = self.alphas.to(device)[t].view(-1, 1, 1, 1)
+        alpha_cum = self.alpha_cum_prod.to(device)[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_cum_prod = self.sqrt_one_minus_alpha_cum_prod.to(device)[t].view(-1, 1, 1, 1)
 
-        mean = xt - ((beta * noise_pred) / (sqrt_one_minus_alpha_cum_prod))
-        mean = mean / torch.sqrt(alpha)
+        mean = (xt - (beta * noise_pred) / (sqrt_one_minus_alpha_cum_prod)) / torch.sqrt(alpha)
 
         if torch.all(t == 0):
-            return mean, None, None
-        else:
-            variance = beta
-            sigma = variance**0.5
-            z = torch.randn(xt.shape).to(xt.device)
-            return mean, sigma * z, None
+            sigma = torch.zeros_like(xt)
+            return mean, sigma
+
+        prev_t = (t - 1).clamp(min=0)
+        alpha_cum_prev = self.alpha_cum_prod.to(device)[prev_t].view(-1, 1, 1, 1)
+        posterior_variance = ((1 - alpha_cum_prev) / (1 - alpha_cum)) * beta
+        sigma = torch.sqrt(posterior_variance)
+        z = torch.randn_like(xt)
+        return mean, sigma * z
 
     def sample_prev_timestep(self, xt, noise_pred, t):
         r"""
@@ -93,9 +101,8 @@ class LinearNoiseScheduler:
         # x0 = torch.clamp(x0, -1., 1.)
 
         # mean = 1/sqrt(alpha) * (xt - (1-alpha)/(sqrt(1-alpha_hat)) * noise_pred)
-        mean = xt - (
-            ((self.betas.to(xt.device)[t]) * noise_pred) / (self.sqrt_one_minus_alpha_cum_prod.to(xt.device)[t])
-        )
+        mean = xt - (((self.betas.to(xt.device)[t]) * noise_pred) /
+                     (self.sqrt_one_minus_alpha_cum_prod.to(xt.device)[t]))
 
         mean = mean / torch.sqrt(self.alphas.to(xt.device)[t])
 

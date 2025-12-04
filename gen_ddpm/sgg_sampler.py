@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -15,28 +15,76 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 
 from gen_ddpm.linear_noise_scheduler import LinearNoiseScheduler
+from gen.sgg_sampler import (
+    _mask_keep_classes,
+    _lcg_loss,
+    _lcg_relative_loss,
+    ce_label,
+    teacher_relative_loss,
+    compute_teacher_logits,
+)
 from gen_ddpm.model import UNet
-from seg.dataloaders.cityscapes import CityscapesSegmentation, IGNORE_LABEL
+from seg.dataloaders.cityscapes import CityscapesSegmentation
 from seg.utils.hf_utils import mask_to_color
 from seg.infer import load_hf_model, ModelBundle
 from srgan_model.models import Generator
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 MEAN, STD = [0.4865, 0.4998, 0.4323], [0.2326, 0.2276, 0.2659]
+
+OUTDIR = "gen_ddpm/ddpm_sgg_samples/benchmark_017_lw1"
+
+GUIDE_LAMBDA = 3.0
+GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13, 18]
+GUIDE_CLASS_WEIGHTS = {
+    13: 3.0,  # car
+    0: 2.0,  # road
+    2: 1.0,  # building
+    1: 1.0,  # sidewalk
+    8: 1.0,  # vegetation
+    9: 1.0,  # terrain
+    10: 1.0,  # sky
+    11: 0.5,  # person
+    12: 0.5,  # rider
+    18: 0.5,  # bicycle
+}
+TEMPERATURE = 1.2
+LOSS_TYPE = "blend"
+BLEND_WEIGHT = 0.2
+PRED_ON_X0_HAT = True
+STEPS = 400
+MODE = "alternate"
+
+
+@dataclass
+class StepOutput:
+    step_index: int
+    timestep: int
+    progress: float
+    sgg_loss: Optional[float]
+    decoded_image: torch.Tensor
+    decoded_x0_image: torch.Tensor
+    predicted_mask: torch.Tensor
+    predicted_mask_x0: torch.Tensor
+    guidance_heatmap: Optional[torch.Tensor] = None
+    tr_heatmap: Optional[torch.Tensor] = None
+    guidance_overlay: Optional[torch.Tensor] = None
+    tr_overlay: Optional[torch.Tensor] = None
 
 
 @dataclass
 class SamplerConfig:
     # data
     dataset_root: str = "data/cityscapes"
-    split: str = "val"
+    split: str = "my_test"
     image_size: int = 128
-    batch_size: int = 1
+    batch_size: int = 4
     num_workers: int = 4
-    max_samples: Optional[int] = 2
+    max_samples: Optional[int] = 1
 
     # diffusion
-    diffusion_steps: int = 50  # how many forward steps to apply before reversing
+    diffusion_steps: int = STEPS  # how many forward steps to apply before reversing
     num_timesteps: int = 1000  # training schedule length
     beta_start: float = 0.0001
     beta_end: float = 0.02
@@ -45,17 +93,24 @@ class SamplerConfig:
     checkpoint: str = "gen_ddpm/checkpoints/1000-checkpoint.ckpt"
     srgan_checkpoint: str = "srgan_model/weights/swift_srgan_4x.pth.tar"
     teacher_model: str = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"
-    guidance_lr: float = 0.1
+
+    guidance_lr: float = GUIDE_LAMBDA
+    guide_allowed_classes: Optional[list[int]] = field(default_factory=lambda: GUIDE_ALLOWED_CLASSES)
+    guide_class_weights: Optional[dict[int, float]] = field(default_factory=lambda: GUIDE_CLASS_WEIGHTS)
+    temperature: float = TEMPERATURE
+    loss_type: str = LOSS_TYPE  # "ce", "kl", or "blend"
+    blend_weight: float = BLEND_WEIGHT
+    pred_on_x0_hat: bool = PRED_ON_X0_HAT
+    mode: str = MODE
 
     # logging
-    output_dir: str = "gen_ddpm/ddpm_sgg_samples"
-    log_every: int = 10  # save intermediate steps every N iterations
+    output_dir: str = OUTDIR
+    log_every: int = 100
+    sanity_check: bool = False
 
 
 def _build_cityscapes_transforms(image_size: int,) -> Tuple[Callable, Callable]:
-    """
-    Resize → center-crop to a square and normalise with dataset mean/std for the DDPM.
-    """
+    """Resize → center-crop to a square and normalise with dataset mean/std for the DDPM."""
 
     def joint_transform(image, mask):
         image = TF.resize(
@@ -65,6 +120,7 @@ def _build_cityscapes_transforms(image_size: int,) -> Tuple[Callable, Callable]:
             antialias=True,
         )
         image = TF.center_crop(image, image_size)
+
         mask = TF.resize(
             mask,
             (image_size, image_size * 2),
@@ -82,6 +138,11 @@ def _build_cityscapes_transforms(image_size: int,) -> Tuple[Callable, Callable]:
 
 
 def _denormalize_to_01(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert from (x - mean)/std space to [0,1] for SRGAN + teacher.
+
+    This is differentiable: gradients w.r.t. the normalized tensor will
+    correctly pass through this operation.
+    """
     mean = torch.tensor(MEAN, device=tensor.device, dtype=tensor.dtype).view(1, -1, 1, 1)
     std = torch.tensor(STD, device=tensor.device, dtype=tensor.dtype).view(1, -1, 1, 1)
     tensor = tensor * std + mean
@@ -96,12 +157,36 @@ def _save_batch_image(batch: torch.Tensor, path: Path, *, nrow: Optional[int] = 
     pil_image.save(path)
 
 
-def _save_history(history: List[Tuple[int, torch.Tensor]], path: Path, prefix: str) -> None:
-    if not history:
-        return
-    path.mkdir(parents=True, exist_ok=True)
-    for step, tensor in sorted(history, key=lambda pair: pair[0]):
-        _save_batch_image(tensor, path / f"{prefix}_t{step:04d}.png")
+def save_01(x01: torch.Tensor, path: Path) -> None:
+    tensor = x01[0].detach().cpu().clamp(0, 1)
+    pil_image = transforms.ToPILImage()(tensor)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pil_image.save(path)
+
+
+def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
+    """Save decoded image/x0 and teacher masks for each logged step."""
+    steps_dir.mkdir(parents=True, exist_ok=True)
+
+    def _callback(step: StepOutput) -> None:
+        suffix = f"step_{step.step_index:03d}_t{step.timestep:04d}"
+
+        save_01(step.decoded_image, steps_dir / f"{suffix}_image.png")
+        save_01(step.decoded_x0_image, steps_dir / f"{suffix}_x0.png")
+
+        mask_to_color(step.predicted_mask[0]).save(steps_dir / f"{suffix}_mask.png")
+        mask_to_color(step.predicted_mask_x0[0]).save(steps_dir / f"{suffix}_mask_x0.png")
+
+        if step.guidance_heatmap is not None:
+            save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
+        if step.tr_heatmap is not None:
+            save_01(step.tr_heatmap, steps_dir / f"{suffix}_tr_grad.png")
+        if step.guidance_overlay is not None:
+            save_01(step.guidance_overlay, steps_dir / f"{suffix}_guidance_overlay.png")
+        if step.tr_overlay is not None:
+            save_01(step.tr_overlay, steps_dir / f"{suffix}_tr_overlay.png")
+
+    return _callback
 
 
 def _move_scheduler_to_device(scheduler: LinearNoiseScheduler, device: torch.device) -> None:
@@ -111,142 +196,188 @@ def _move_scheduler_to_device(scheduler: LinearNoiseScheduler, device: torch.dev
     scheduler.sqrt_alpha_cum_prod = scheduler.sqrt_alpha_cum_prod.to(device)
     scheduler.one_minus_cum_prod = scheduler.one_minus_cum_prod.to(device)
     scheduler.sqrt_one_minus_alpha_cum_prod = scheduler.sqrt_one_minus_alpha_cum_prod.to(device)
+    scheduler.max_sigma = scheduler.max_sigma.to(device)
 
 
-def _prepare_teacher_inputs(
-    image_batch: torch.Tensor,
-    processor,
-    target_size: Tuple[int, int],
-) -> torch.Tensor:
-    pixel_values = image_batch
+def run_shape_sanity_check(
+    model: UNet,
+    scheduler: LinearNoiseScheduler,
+    image_size: int,
+    device: torch.device,
+) -> None:
+    """Lightweight smoke test to ensure model, scheduler, and time embeddings agree on shapes."""
+    with torch.no_grad():
+        x = torch.randn(1, 3, image_size, image_size, device=device)
+        t = torch.tensor([scheduler.num_timesteps - 1], device=device, dtype=torch.long)
+        time_embed = scheduler.one_minus_cum_prod.to(device)[t].view(-1, 1, 1, 1)
+        out = model(x, time_embed)
+        assert out.shape == x.shape, f"UNet output {out.shape} != input {x.shape}"
 
-    desired_height, desired_width = target_size
-    if getattr(processor, "do_resize", False):
-        size_config = getattr(processor, "size", {}) or {}
-        desired_height = size_config.get("height", desired_height)
-        desired_width = size_config.get("width", desired_width)
-
-    if pixel_values.shape[-2:] != (desired_height, desired_width):
-        pixel_values = F.interpolate(
-            pixel_values,
-            size=(desired_height, desired_width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-    if getattr(processor, "do_rescale", False):
-        scale = float(getattr(processor, "rescale_factor", 1.0))
-        pixel_values = pixel_values * 255.0 * scale
-
-    if getattr(processor, "do_normalize", False):
-        mean = torch.tensor(
-            getattr(processor, "image_mean", [0.5, 0.5, 0.5]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        ).view(1, -1, 1, 1)
-        std = torch.tensor(
-            getattr(processor, "image_std", [0.5, 0.5, 0.5]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
-        ).view(1, -1, 1, 1)
-        pixel_values = (pixel_values - mean) / std
-
-    return pixel_values
-
-
-def compute_teacher_logits(
-    image_batch: torch.Tensor,
-    bundle: ModelBundle,
-    *,
-    target_size: Tuple[int, int],
-) -> torch.Tensor:
-    pixel_values = _prepare_teacher_inputs(image_batch.to(bundle.device), bundle.processor, target_size)
-    outputs = bundle.model(pixel_values=pixel_values)
-    logits = outputs.logits
-    if logits.shape[-2:] != target_size:
-        logits = F.interpolate(
-            logits,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-    return logits
-
-
-def ce_label(
-    logits: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-    target = mask.to(device=logits.device, dtype=torch.long)
-    return F.cross_entropy(logits, target, ignore_index=IGNORE_LABEL)
-
-
-def _lcg_loss(
-    mask_batch: torch.Tensor,
-    logits: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    """
-    Label-conditional guidance: compute per-class NLL over each present class region, average across classes.
-    Returns None if no valid class pixels.
-    """
-    log_probs = F.log_softmax(logits, dim=1)
-
-    classes = torch.unique(mask_batch)
-    classes = classes[classes != IGNORE_LABEL]
-    if classes.numel() == 0:
-        return None
-
-    per_class_losses = []
-    for cls in classes:
-        region_mask = (mask_batch == cls)
-        if not region_mask.any():
-            continue
-        # Only penalise pixels belonging to this class
-        nll = -log_probs[:, cls][region_mask]
-        per_class_losses.append(nll.mean())
-
-    if not per_class_losses:
-        return None
-
-    return torch.stack(per_class_losses).mean()
+        xt = scheduler.add_noise2(x, torch.randn_like(x), t)
+        assert xt.shape == x.shape, f"add_noise2 output {xt.shape} != input {x.shape}"
 
 
 def apply_segmentation_guidance(
-    sample: torch.Tensor,
+    x_t: torch.Tensor,
     mask: torch.Tensor,
     srgan: Generator,
     teacher_bundle: ModelBundle,
     *,
-    guidance_lr: float,
+    guidance_lr_t: torch.Tensor,
     mode: str,
+    allowed_classes: Optional[list[int]],
+    class_weights: Optional[dict[int, float]],
+    temperature: float,
+    loss_type: str,
+    blend_weight: float,
+    reference_logits: Optional[torch.Tensor],
+    pred_on_x0_hat: bool,
+    eps_xt: Optional[torch.Tensor],
+    sigma_t: torch.Tensor,
+    sqrt_alpha_bar: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Upscale sample → run segmentation → guidance loss → downsample gradient to update sample.
-    Alternates between:
-    - GSG: CE on full mask.
-    - LCG: CE averaged per present class regions.
+    Compute semantic guidance gradient w.r.t. the *diffusion variable* x_t.
+
+    If pred_on_x0_hat=True:
+      - teacher sees x0_hat = (x_t - sigma_t * eps_xt) / sqrt(alpha_bar),
+      - gradient is still taken w.r.t x_t via chain rule.
+
+    Otherwise:
+      - teacher sees x_t (decoded to [0,1] and upscaled by SRGAN),
+      - gradient is w.r.t x_t directly.
     """
-    sr_input = _denormalize_to_01(sample).detach().requires_grad_(True)
-    sr_image = srgan(sr_input)  # [B,3,512,512]
+    # Detach from UNet / previous steps, but keep a gradient graph w.r.t x_t itself.
+    x_var = x_t.detach().requires_grad_(True)
+
+    if pred_on_x0_hat:
+        if eps_xt is None:
+            raise ValueError("eps_xt is required when pred_on_x0_hat=True.")
+        # eps_xt is detached so we do NOT backprop into the UNet.
+        x_teacher_base = (x_var - sigma_t * eps_xt.detach()) / sqrt_alpha_bar
+    else:
+        x_teacher_base = x_var
+
+    # Decode for SRGAN + segmentation teacher.
+    sr_input = _denormalize_to_01(x_teacher_base)
+    sr_image = srgan(sr_input)  # [B, 3, 512, 512]
+
     target_size = sr_image.shape[-2:]
+    mask_up = F.interpolate(
+        mask.float().unsqueeze(1),
+        size=target_size,
+        mode="nearest",
+    ).squeeze(1).long()
+    mask_up = _mask_keep_classes(mask_up, allowed_classes)
 
-    logits = compute_teacher_logits(sr_image, teacher_bundle, target_size=target_size)
-
-    mask_up = F.interpolate(mask.float().unsqueeze(1), size=target_size, mode="nearest").squeeze(1).long()
-
+    # Compute semantic loss (GSG or LCG, CE/KL/blend)
     if mode == "lcg":
-        loss = _lcg_loss(mask_up, logits)
+        if loss_type == "kl":
+            loss = _lcg_relative_loss(
+                sr_image,
+                mask_up,
+                reference_logits,
+                teacher_bundle,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+        elif loss_type == "ce":
+            loss = _lcg_loss(
+                sr_image,
+                mask_up,
+                teacher_bundle,
+                class_weights=class_weights,
+            )
+        else:
+            ce_loss = _lcg_loss(
+                sr_image,
+                mask_up,
+                teacher_bundle,
+                class_weights=class_weights,
+            )
+            kl_loss = _lcg_relative_loss(
+                sr_image,
+                mask_up,
+                reference_logits,
+                teacher_bundle,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+            if ce_loss is None and kl_loss is None:
+                loss = None
+            elif ce_loss is None:
+                loss = kl_loss
+            elif kl_loss is None:
+                loss = ce_loss
+            else:
+                loss = blend_weight * kl_loss + (1.0 - blend_weight) * ce_loss
+
+        # Fallback if no valid class-region was found.
         if loss is None:
-            loss = ce_label(logits, mask_up)
-    else:  # gsg
-        loss = ce_label(logits, mask_up)
+            loss = ce_label(
+                sr_image,
+                mask_up,
+                teacher_bundle,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+    else:  # GSG
+        if loss_type == "kl":
+            loss = teacher_relative_loss(
+                sr_image,
+                reference_logits,
+                teacher_bundle,
+                mask=mask_up,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+        elif loss_type == "ce":
+            loss = ce_label(
+                sr_image,
+                mask_up,
+                teacher_bundle,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+        else:
+            ce_loss = ce_label(
+                sr_image,
+                mask_up,
+                teacher_bundle,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+            kl_loss = teacher_relative_loss(
+                sr_image,
+                reference_logits,
+                teacher_bundle,
+                mask=mask_up,
+                temperature=temperature,
+                class_weights=class_weights,
+            )
+            loss = blend_weight * kl_loss + (1.0 - blend_weight) * ce_loss
 
-    grad_sr = torch.autograd.grad(loss, sr_image, retain_graph=False, create_graph=False)[0]
-    grad_base = F.interpolate(grad_sr, size=sample.shape[-2:], mode="bilinear", align_corners=False)
+    # If still None (very degenerate case), skip guidance
+    if loss is None:
+        return x_t.detach(), torch.tensor(0.0, device=x_t.device)
 
-    guided = sample + guidance_lr * grad_base.to(sample.device)
+    # Gradient of loss w.r.t *x_t*
+    grad_x = torch.autograd.grad(
+        loss,
+        x_var,
+        retain_graph=False,
+        create_graph=False,
+    )[0]
+
+    # Gradient descent on the semantic loss (move towards *lower* CE/NLL/KL)
+    guided = x_var - guidance_lr_t * grad_x
+
+    # Optional diagnostics
+    print(f"Segmentation guidance ({mode}): "
+          f"loss={loss.item():.4f}, "
+          f"grad_x min/max={grad_x.min().item():.6f}/{grad_x.max().item():.6f}, "
+          f"guidance_lr_t mean={guidance_lr_t.mean().item():.6f}")
+
     return guided.detach(), loss.detach()
 
 
@@ -270,14 +401,12 @@ def load_srgan(checkpoint: str, device: torch.device) -> Generator:
 
 def build_loader(config: SamplerConfig) -> tuple[CityscapesSegmentation, DataLoader]:
     joint_transform, image_transform = _build_cityscapes_transforms(config.image_size)
-
     dataset = CityscapesSegmentation(
         root_dir=config.dataset_root,
         split=config.split,
         joint_transform=joint_transform,
         image_transform=image_transform,
     )
-
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -295,23 +424,15 @@ def forward_diffuse(
     steps: int,
     *,
     log_every: int = 0,
-) -> tuple[torch.Tensor, List[Tuple[int, torch.Tensor]]]:
-    """
-    Jump directly to timestep `steps - 1` in the forward process (no incremental noise).
-    """
+) -> torch.Tensor:
+    """Jump directly to timestep steps - 1 in the forward process (no incremental noise)."""
     if steps < 1:
         raise ValueError("steps must be >= 1 for forward diffusion.")
-
     t_value = steps - 1
     t = torch.full((x0.size(0),), t_value, device=x0.device, dtype=torch.long)
     noise = torch.randn_like(x0)
     xt = scheduler.add_noise2(x0, noise, t)
-
-    history: List[Tuple[int, torch.Tensor]] = []
-    if log_every:
-        history.append((t_value, xt.detach().cpu()))
-
-    return xt, history
+    return xt
 
 
 def reverse_denoise(
@@ -324,43 +445,112 @@ def reverse_denoise(
     srgan: Generator,
     teacher_bundle: ModelBundle,
     guidance_lr: float,
+    reference_logits: Optional[torch.Tensor],
+    allowed_classes: Optional[list[int]],
+    class_weights: Optional[dict[int, float]],
+    temperature: float,
+    loss_type: str,
+    blend_weight: float,
+    pred_on_x0_hat: bool,
+    mode: str = "alternate",
     log_every: int = 0,
-) -> tuple[torch.Tensor, List[Tuple[int, torch.Tensor]]]:
+    step_logger: Optional[Callable[[StepOutput], None]] = None,
+) -> torch.Tensor:
     """
     Reverse the diffusion chain x_t → x_0 using the trained DDPM model with SRGAN + segmentation guidance.
+
+    Guidance is always applied to x_t, even if the teacher predicts on x0_hat.
     """
     x = xt
-    history: List[Tuple[int, torch.Tensor]] = []
+    total_steps = steps
 
     for idx, step in enumerate(tqdm(reversed(range(steps)), desc="DDPM Denoising")):
         t = torch.full((x.size(0),), step, device=x.device, dtype=torch.long)
-        time_embed = scheduler.one_minus_cum_prod.to(x.device)[t].view(-1, 1, 1, 1)
-        noise_pred = model(x, time_embed)
 
-        mean, sigma, _ = scheduler.sample_prev_timestep2(x, noise_pred, t)
-        sample = mean if step == 0 else mean + sigma
+        alpha_bar = scheduler.alpha_cum_prod.to(x.device)[t].view(-1, 1, 1, 1)
+        sqrt_alpha_bar = scheduler.sqrt_alpha_cum_prod.to(x.device)[t].view(-1, 1, 1, 1)
+        sigma_t = scheduler.sqrt_one_minus_alpha_cum_prod.to(x.device)[t].view(-1, 1, 1, 1)
 
-        # --- SRGAN upscale → segmentation CE guidance ---
-        sample = sample.detach()
-        sample.requires_grad_(True)
+        # Time embedding for UNet (same encoding as during training).
+        t_embed = scheduler.one_minus_cum_prod.to(x.device)[t].view(-1, 1, 1, 1)
 
-        mode = "gsg"  # "gsg" if idx % 2 == 0 else "lcg"
+        # Noise prediction on current x_t (no gradients needed here).
+        with torch.no_grad():
+            eps_xt = model(x, t_embed)
 
-        guided_sample, _ = apply_segmentation_guidance(
-            sample,
+        # Guidance schedule: stronger at later, cleaner steps (small t).
+        # sqrt_alpha_bar is ~1 at t=0 (clean), and small at large t (noisy).
+        # max_sigma = scheduler.max_sigma.to(x.device)
+        # guidance_lr_t = guidance_lr * (sigma_t / max_sigma)
+        guidance_lr_t = guidance_lr * sqrt_alpha_bar
+
+        if mode == "alternate":
+            selected_mode = "gsg" if idx % 2 == 0 else "lcg"
+        elif mode in ("gsg", "lcg"):
+            selected_mode = mode
+
+        # Semantic guidance step (gradients only through teacher + SRGAN into x_t).
+        x_guided, loss = apply_segmentation_guidance(
+            x,
             mask,
             srgan,
             teacher_bundle,
-            mode=mode,
-            guidance_lr=guidance_lr,
+            guidance_lr_t=guidance_lr_t,
+            mode=selected_mode,
+            allowed_classes=allowed_classes,
+            class_weights=class_weights,
+            temperature=temperature,
+            loss_type=loss_type,
+            blend_weight=blend_weight,
+            reference_logits=reference_logits,
+            pred_on_x0_hat=pred_on_x0_hat,
+            eps_xt=eps_xt,
+            sigma_t=sigma_t,
+            sqrt_alpha_bar=sqrt_alpha_bar,
         )
+        x = x_guided
 
-        x = guided_sample.detach()
+        # Recompute noise prediction for the *guided* x_t and take the DDPM step.
+        with torch.no_grad():
+            eps_guided = model(x, t_embed)
+            mean, sigma = scheduler.sample_prev_timestep2(x, eps_guided, t)
+            x = mean if step == 0 else mean + sigma
 
-        if log_every and (step % log_every == 0 or step == 0):
-            history.append((step, x.detach().cpu()))
+        # Logging of teacher outputs (optional)
+        if step_logger is not None and (log_every and (step % log_every == 0 or step == 0)):
+            with torch.no_grad():
+                # Use x_guided at this timestep for visualization
+                sr_image = srgan(_denormalize_to_01(x_guided))
+                logits = compute_teacher_logits(
+                    sr_image,
+                    teacher_bundle,
+                    target_size=sr_image.shape[-2:],
+                )
+                pred_mask = logits.argmax(dim=1)
 
-    return x, history
+                # x0_hat based on guided x_t and eps_guided
+                x0_hat = (x_guided - sigma_t * eps_guided) / sqrt_alpha_bar
+                x0_image = srgan(_denormalize_to_01(x0_hat))
+                logits_x0 = compute_teacher_logits(
+                    x0_image,
+                    teacher_bundle,
+                    target_size=x0_image.shape[-2:],
+                )
+                pred_mask_x0 = logits_x0.argmax(dim=1)
+
+                step_logger(
+                    StepOutput(
+                        step_index=idx,
+                        timestep=step,
+                        progress=1.0 - (step / max(1, total_steps - 1)),
+                        sgg_loss=float(loss.detach().cpu().item()),
+                        decoded_image=sr_image,
+                        decoded_x0_image=x0_image,
+                        predicted_mask=pred_mask,
+                        predicted_mask_x0=pred_mask_x0,
+                    ))
+
+    return x
 
 
 def run_pipeline(
@@ -373,10 +563,29 @@ def run_pipeline(
     teacher_bundle: ModelBundle,
     steps: int,
     guidance_lr: float,
+    allowed_classes: Optional[list[int]],
+    class_weights: Optional[dict[int, float]],
+    temperature: float,
+    loss_type: str,
+    blend_weight: float,
+    pred_on_x0_hat: bool,
+    mode: str = "alternate",
     log_every: int,
-) -> tuple[torch.Tensor, torch.Tensor, List[Tuple[int, torch.Tensor]], List[Tuple[int, torch.Tensor]]]:
-    noised, forward_history = forward_diffuse(image_batch, scheduler, steps, log_every=log_every)
-    denoised, reverse_history = reverse_denoise(
+    step_logger: Optional[Callable[[StepOutput], None]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Reference logits from original clean images for KL-type relative losses.
+    with torch.no_grad():
+        ref_sr = srgan(_denormalize_to_01(image_batch))
+        ref_target = ref_sr.shape[-2:]
+        reference_logits = compute_teacher_logits(
+            ref_sr,
+            teacher_bundle,
+            target_size=ref_target,
+        )
+
+    noised = forward_diffuse(image_batch, scheduler, steps, log_every=log_every)
+
+    denoised = reverse_denoise(
         noised,
         model,
         scheduler,
@@ -385,9 +594,19 @@ def run_pipeline(
         srgan=srgan,
         teacher_bundle=teacher_bundle,
         guidance_lr=guidance_lr,
+        reference_logits=reference_logits,
+        allowed_classes=allowed_classes,
+        class_weights=class_weights,
+        temperature=temperature,
+        loss_type=loss_type,
+        blend_weight=blend_weight,
+        pred_on_x0_hat=pred_on_x0_hat,
+        mode=mode,
         log_every=log_every,
+        step_logger=step_logger,
     )
-    return noised, denoised, forward_history, reverse_history
+
+    return noised, denoised
 
 
 def save_outputs(
@@ -398,65 +617,17 @@ def save_outputs(
     mask: torch.Tensor,
     noised: torch.Tensor,
     denoised: torch.Tensor,
-    forward_history: List[Tuple[int, torch.Tensor]],
-    reverse_history: List[Tuple[int, torch.Tensor]],
     final_timestep: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-
     _save_batch_image(original, out_dir / f"{base_name}_orig.png")
     mask_to_color(mask[0]).save(out_dir / f"{base_name}_mask.png")
     _save_batch_image(noised, out_dir / f"{base_name}_noised_t{final_timestep:04d}.png")
     _save_batch_image(denoised, out_dir / f"{base_name}_denoised.png")
 
-    _save_history(forward_history, out_dir / "steps" / "forward", prefix="forward")
-    _save_history(reverse_history, out_dir / "steps" / "reverse", prefix="reverse")
-
-
-def parse_args() -> SamplerConfig:
-    parser = argparse.ArgumentParser(description="Run DDPM noising/denoising on Cityscapes samples.")
-    parser.add_argument("--dataset-root", type=str, default="data/cityscapes")
-    parser.add_argument("--split", type=str, default="val")
-    parser.add_argument("--image-size", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--max-samples", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=500)
-    parser.add_argument("--num-timesteps", type=int, default=1000)
-    parser.add_argument("--beta-start", type=float, default=0.0001)
-    parser.add_argument("--beta-end", type=float, default=0.02)
-    parser.add_argument("--checkpoint", type=str, default="gen_ddpm/checkpoints/1000-checkpoint.ckpt")
-    parser.add_argument("--srgan-checkpoint", type=str, default="srgan_model/weights/swift_srgan_4x.pth.tar")
-    parser.add_argument("--teacher-model", type=str, default="nvidia/segformer-b3-finetuned-cityscapes-1024-1024")
-    parser.add_argument("--guidance-lr", type=float, default=1.2)  # 0.8 was good
-    parser.add_argument("--output-dir", type=str, default="gen_ddpm/ddpm_sgg_samples/run7_gsg_lcg")
-    parser.add_argument("--log-every", type=int, default=100)
-
-    args = parser.parse_args()
-    max_samples = args.max_samples if args.max_samples >= 0 else None
-
-    return SamplerConfig(
-        dataset_root=args.dataset_root,
-        split=args.split,
-        image_size=args.image_size,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        max_samples=max_samples,
-        diffusion_steps=args.steps,
-        num_timesteps=args.num_timesteps,
-        beta_start=args.beta_start,
-        beta_end=args.beta_end,
-        checkpoint=args.checkpoint,
-        srgan_checkpoint=args.srgan_checkpoint,
-        teacher_model=args.teacher_model,
-        guidance_lr=args.guidance_lr,
-        output_dir=args.output_dir,
-        log_every=args.log_every,
-    )
-
 
 def main() -> None:
-    config = parse_args()
+    config = SamplerConfig()
 
     if config.diffusion_steps < 1:
         raise ValueError("diffusion_steps must be >= 1.")
@@ -465,29 +636,57 @@ def main() -> None:
 
     model = load_model(config.checkpoint, DEVICE)
     srgan = load_srgan(config.srgan_checkpoint, DEVICE)
+
     teacher_bundle = load_hf_model(config.teacher_model, device=str(DEVICE))
     for p in teacher_bundle.model.parameters():
         p.requires_grad_(False)
-    scheduler = LinearNoiseScheduler(config.num_timesteps, config.beta_start, config.beta_end)
+
+    scheduler = LinearNoiseScheduler(
+        config.num_timesteps,
+        config.beta_start,
+        config.beta_end,
+    )
     _move_scheduler_to_device(scheduler, DEVICE)
 
+    if config.sanity_check:
+        run_shape_sanity_check(model, scheduler, config.image_size, DEVICE)
+
     dataset, loader = build_loader(config)
+
     output_root = Path(config.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
     sample_counter = 0
 
     for batch_idx, (batch_images, batch_masks) in enumerate(loader):
         batch_images = batch_images.to(device=DEVICE, dtype=torch.float32)
         batch_masks = batch_masks.to(device=DEVICE)
-
         batch_size = batch_images.size(0)
+
         if config.max_samples is not None and sample_counter >= config.max_samples:
             break
+        if batch_size == 0:
+            continue
 
-        rand_idx = torch.randint(0, batch_size, (1,)).item()
+        # rand_idx = torch.randint(0, batch_size, (1,)).item()
+        rand_idx = 2
         image = batch_images[rand_idx:rand_idx + 1]
         mask = batch_masks[rand_idx:rand_idx + 1]
 
-        noised, denoised, forward_history, reverse_history = run_pipeline(
+        dataset_idx = min(
+            len(dataset.samples) - 1,
+            batch_idx * config.batch_size + rand_idx,
+        )
+        sample_info = dataset.samples[dataset_idx]
+        relative = sample_info.image_path.relative_to(dataset.left_dir)
+
+        sample_dir = output_root / relative.parent
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        base_name = relative.stem.replace("_leftImg8bit", "")
+
+        step_logger = build_step_logger(sample_dir / "steps") if config.log_every else None
+
+        noised, denoised = run_pipeline(
             model,
             scheduler,
             image,
@@ -496,14 +695,16 @@ def main() -> None:
             teacher_bundle=teacher_bundle,
             steps=config.diffusion_steps,
             guidance_lr=config.guidance_lr,
+            allowed_classes=config.guide_allowed_classes,
+            class_weights=config.guide_class_weights,
+            temperature=config.temperature,
+            loss_type=config.loss_type,
+            blend_weight=config.blend_weight,
+            pred_on_x0_hat=config.pred_on_x0_hat,
+            mode=config.mode,
             log_every=config.log_every,
+            step_logger=step_logger,
         )
-
-        dataset_idx = min(len(dataset.samples) - 1, batch_idx * config.batch_size + rand_idx)
-        sample_info = dataset.samples[dataset_idx]
-        relative = sample_info.image_path.relative_to(dataset.left_dir)
-        sample_dir = output_root / relative.parent
-        base_name = relative.stem.replace("_leftImg8bit", "")
 
         save_outputs(
             sample_dir,
@@ -512,8 +713,6 @@ def main() -> None:
             mask=mask.cpu(),
             noised=noised.cpu(),
             denoised=denoised.cpu(),
-            forward_history=forward_history,
-            reverse_history=reverse_history,
             final_timestep=config.diffusion_steps - 1,
         )
 
@@ -522,7 +721,6 @@ def main() -> None:
             config_path.write_text(json.dumps(asdict(config), indent=2))
 
         sample_counter += 1
-
         if config.max_samples is not None and sample_counter >= config.max_samples:
             break
 

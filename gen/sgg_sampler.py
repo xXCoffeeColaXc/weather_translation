@@ -23,7 +23,7 @@ from torch.cuda.amp import autocast as cuda_autocast
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionModel, StableDiffusion3Pipeline
 
-from val_sd import _select_dtype, _load_component_if_exists
+from gen.val_sd import _select_dtype, _load_component_if_exists
 
 from seg.dataloaders.cityscapes import CityscapesSegmentation, IGNORE_LABEL
 from seg.infer import ModelBundle, build_cityscapes_dataloader, load_hf_model
@@ -259,6 +259,7 @@ def _maybe_apply_sgg(
         print(" No SGG guidance at this step.")
         return latents_next.detach(), None, None
 
+    # TODO: try inverse
     #strongest when the image is almost pure noise
     alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
