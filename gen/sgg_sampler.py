@@ -35,7 +35,7 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OUTDIR = "eval_city/benchmark_inversion_09_gsg_gated_fog7"
+OUTDIR = "eval_city/benchmark_inversion_09_gsg_gated_fog9"
 
 # CONDITION = "rain"
 # PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
@@ -55,8 +55,8 @@ GUIDE_BLUR_SIGMA = 0.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
                          18]  # road, sidewalk, building, vegetation, terrain, sky, rider, car, bycicle
 GUIDE_CLASS_WEIGHTS = {
-    13: 3.0,  # car
-    0: 2.0,  # road
+    13: 1.0,  # car
+    0: 1.0,  # road
     2: 1.0,  # building
     1: 1.0,  # sidewalk
     8: 1.0,  # vegetation
@@ -68,7 +68,7 @@ GUIDE_CLASS_WEIGHTS = {
 }
 GUIDE_TV_WEIGHT = 0.01
 
-TEMPERATURE = 1.0
+TEMPERATURE = 1.1
 LAMBDA_TR = 0.25
 
 PROTECTED_CLASSES = {
@@ -78,7 +78,7 @@ PROTECTED_CLASSES = {
 }
 
 GRAD_EPS = 1e-8
-LOSS_TYPE = "ce"  # "ce" or "kl" or "blend"
+LOSS_TYPE = "blend"  # "ce" or "kl" or "blend"
 BLEND_WEIGHT = 0.7
 CALLBACK_INTERVAL = 5
 PRED_ON_X0_HAT = True
@@ -263,7 +263,8 @@ def _maybe_apply_sgg(
     #strongest when the image is almost pure noise
     alpha_bar_t = pipe.scheduler.alphas_cumprod[int(timestep)]  # scalar tensor
     sigma_t = torch.sqrt(1 - alpha_bar_t)  # ∝ noise level
-    guide_lambda_t = config.guide_lambda * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
+    #guide_lambda_t = config.guide_lambda * (sigma_t / pipe.scheduler.alphas_cumprod.sqrt().max())  # normalize
+    guide_lambda_t = config.guide_lambda * alpha_bar_t.sqrt()
 
     latents_ori = latents_next.detach()  # teacher/base branch (no grad)
     latents_guided = latents_ori.clone().detach().requires_grad_(True)  # branch we backprop through
