@@ -1,196 +1,272 @@
-from typing import Callable, Union, Optional
-from collections import namedtuple
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterable, List, Sequence
 
 import numpy as np
 from PIL import Image
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
-from torch.utils.data import DataLoader
-from seg.utils.ext_transform import ExtCompose
+from seg.dataloaders.cityscapes import (
+    IGNORE_LABEL,
+    encode_target as _encode_cityscapes_target,
+    _default_image_transform,
+    _ensure_tensor,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+IMAGE_SUFFIX = "_rgb_anon.png"
+IMAGE_REF_SUFFIX = "_rgb_ref_anon.png"
+GT_LABEL_SUFFIX = "_gt_labelIds.png"
+GT_TRAIN_SUFFIX = "_gt_labelTrainIds.png"
+
+DEFAULT_WEATHERS = ("fog", "night", "rain", "snow")
 
 
-class ACDCDataset(Dataset):
+def _list_weathers(weather: str | Iterable[str]) -> List[str]:
+    if isinstance(weather, str):
+        if weather == "all":
+            return list(DEFAULT_WEATHERS)
+        return [weather]
+    return list(weather)
 
-    CityscapesClass = namedtuple(
-        'CityscapesClass',
-        ['name', 'id', 'train_id', 'category', 'category_id', 'has_instances', 'ignore_in_eval', 'color'])
 
-    # TODO: add weights to the class
-    #     # Define the class weights (example values, can be adjusted)
-    # weights = {
-    #     0: 1.0,    # road
-    #     1: 1.0,    # sidewalk
-    #     2: 2.0,    # building
-    #     3: 2.5,    # wall
-    #     4: 2.0,    # fence
-    #     5: 1.5,    # pole
-    #     6: 3.0,    # traffic light
-    #     7: 2.5,    # traffic sign
-    #     8: 1.0,    # vegetation
-    #     9: 1.2,    # terrain
-    #     10: 1.0,   # sky
-    #     11: 3.0,   # person
-    #     12: 2.5,   # rider
-    #     13: 1.0,   # car
-    #     14: 1.5,   # truck
-    #     15: 1.5,   # bus
-    #     16: 3.0,   # train
-    #     17: 2.5,   # motorcycle
-    #     18: 2.0,   # bicycle
-    # }
+@dataclass(frozen=True)
+class ACDCSample:
+    image_path: Path
+    mask_path: Path
+    ref_image_path: Path
 
-    classes = [
-        CityscapesClass('unlabeled', 0, 255, 'void', 0, False, True, (0, 0, 0)),
-        CityscapesClass('ego vehicle', 1, 255, 'void', 0, False, True, (0, 0, 0)),
-        CityscapesClass('rectification border', 2, 255, 'void', 0, False, True, (0, 0, 0)),
-        CityscapesClass('out of roi', 3, 255, 'void', 0, False, True, (0, 0, 0)),
-        CityscapesClass('static', 4, 255, 'void', 0, False, True, (0, 0, 0)),
-        CityscapesClass('dynamic', 5, 255, 'void', 0, False, True, (111, 74, 0)),
-        CityscapesClass('ground', 6, 255, 'void', 0, False, True, (81, 0, 81)),
-        CityscapesClass('road', 7, 0, 'flat', 1, False, False, (128, 64, 128)),
-        CityscapesClass('sidewalk', 8, 1, 'flat', 1, False, False, (244, 35, 232)),
-        CityscapesClass('parking', 9, 255, 'flat', 1, False, True, (250, 170, 160)),
-        CityscapesClass('rail track', 10, 255, 'flat', 1, False, True, (230, 150, 140)),
-        CityscapesClass('building', 11, 2, 'construction', 2, False, False, (70, 70, 70)),
-        CityscapesClass('wall', 12, 3, 'construction', 2, False, False, (102, 102, 156)),
-        CityscapesClass('fence', 13, 4, 'construction', 2, False, False, (190, 153, 153)),
-        CityscapesClass('guard rail', 14, 255, 'construction', 2, False, True, (180, 165, 180)),
-        CityscapesClass('bridge', 15, 255, 'construction', 2, False, True, (150, 100, 100)),
-        CityscapesClass('tunnel', 16, 255, 'construction', 2, False, True, (150, 120, 90)),
-        CityscapesClass('pole', 17, 5, 'object', 3, False, False, (153, 153, 153)),
-        CityscapesClass('polegroup', 18, 255, 'object', 3, False, True, (153, 153, 153)),
-        CityscapesClass('traffic light', 19, 6, 'object', 3, False, False, (250, 170, 30)),
-        CityscapesClass('traffic sign', 20, 7, 'object', 3, False, False, (220, 220, 0)),
-        CityscapesClass('vegetation', 21, 8, 'nature', 4, False, False, (107, 142, 35)),
-        CityscapesClass('terrain', 22, 9, 'nature', 4, False, False, (152, 251, 152)),
-        CityscapesClass('sky', 23, 10, 'sky', 5, False, False, (70, 130, 180)),
-        CityscapesClass('person', 24, 11, 'human', 6, True, False, (220, 20, 60)),
-        CityscapesClass('rider', 25, 12, 'human', 6, True, False, (255, 0, 0)),
-        CityscapesClass('car', 26, 13, 'vehicle', 7, True, False, (0, 0, 142)),
-        CityscapesClass('truck', 27, 14, 'vehicle', 7, True, False, (0, 0, 70)),
-        CityscapesClass('bus', 28, 15, 'vehicle', 7, True, False, (0, 60, 100)),
-        CityscapesClass('caravan', 29, 255, 'vehicle', 7, True, True, (0, 0, 90)),
-        CityscapesClass('trailer', 30, 255, 'vehicle', 7, True, True, (0, 0, 110)),
-        CityscapesClass('train', 31, 16, 'vehicle', 7, True, False, (0, 80, 100)),
-        CityscapesClass('motorcycle', 32, 17, 'vehicle', 7, True, False, (0, 0, 230)),
-        CityscapesClass('bicycle', 33, 18, 'vehicle', 7, True, False, (119, 11, 32)),
-        CityscapesClass('license plate', -1, 255, 'vehicle', 7, False, True, (0, 0, 142)),
-    ]
 
-    # Create a dictionary mapping class IDs to class names
-    class_id_to_name = {c.train_id: c.name for c in classes}
-    train_id_to_color = [c.color for c in classes if (c.train_id != -1 and c.train_id != 255)]
-    train_id_to_color.append([0, 0, 0])
-    train_id_to_color = np.array(train_id_to_color)
-    id_to_train_id = np.array([c.train_id for c in classes])
+class ACDCSegmentation(Dataset):
+    """
+    Dataset that yields (image, mask, ref_image) triplets for the ACDC dataset.
 
-    def __init__(self,
-                 root_dir: str,
-                 split: str = 'train',
-                 weather: Union[str, list[str]] = 'all',
-                 transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
-                 target_transform: Optional[Callable[[Image.Image], torch.Tensor]] = None):
-        """
-        Args:
-            root_dir (str or Path): Root directory of the dataset (parent of 'gt' and 'rgb_anon' folders).
-            split (str): One of 'train', 'val', 'test', etc.
-            weather (str): One of 'fog', 'night', 'rain', 'snow', or 'all' to include all conditions.
-            transform (callable, optional): Optional transform to be applied on an image.
-            target_transform (callable, optional): Optional transform to be applied on a label.
-        """
-        self.root_dir = Path(root_dir)
+    Directory structure (per weather condition):
+      - rgb_anon/<weather>/<split>/**/*_rgb_anon.png
+      - rgb_anon/<weather>/<split>_ref/**/*_rgb_ref_anon.png
+      - gt/<weather>/<split>/**/*_gt_labelIds.png (or *_gt_labelTrainIds.png)
+    """
+
+    def __init__(
+        self,
+        root_dir: str | Path,
+        split: str = "train",
+        *,
+        weather: str | Iterable[str] = "all",
+        joint_transform: Callable[[Image.Image, Image.Image, Image.Image], tuple[Image.Image, Image.Image, Image.Image]]
+        | None = None,
+        image_transform: Callable[[Image.Image], torch.Tensor] | None = None,
+        target_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        self.root_dir = Path(root_dir).expanduser()
         self.split = split
-        self.weather = weather
-        self.transform = transform
+        self.weathers = _list_weathers(weather)
+        self.joint_transform = joint_transform
+        self.image_transform = image_transform or _default_image_transform
         self.target_transform = target_transform
 
-        self.image_paths = []
-        self.label_paths = []
+        self.rgb_root = self.root_dir / "rgb_anon"
+        self.gt_root = self.root_dir / "gt"
+        if not self.rgb_root.exists():
+            raise FileNotFoundError(f"Image root not found: {self.rgb_root}")
+        if not self.gt_root.exists():
+            raise FileNotFoundError(f"Mask root not found: {self.gt_root}")
 
-        if weather == 'all':
-            weather_conditions = ['fog', 'night', 'rain', 'snow']
-        #elif all(item in ['fog', 'night', 'rain', 'snow'] for item in weather):
-        else:
-            weather_conditions = weather
+        self.samples: list[ACDCSample] = self._collect_samples()
+        if not self.samples:
+            LOGGER.warning("No ACDC samples found under %s", self.root_dir)
 
-        for condition in weather_conditions:
-            rgb_dir = self.root_dir / 'rgb_anon' / condition / split
-            gt_dir = self.root_dir / 'gt' / condition / split
+    def _collect_samples(self) -> list[ACDCSample]:
+        samples: list[ACDCSample] = []
+        for weather in self.weathers:
+            img_dir = self.rgb_root / weather / self.split
+            ref_dir = self.rgb_root / weather / f"{self.split}_ref"
+            mask_dir = self.gt_root / weather / self.split
 
-            # For each image in rgb_dir, find the corresponding label in gt_dir
-            image_pattern = '**/*_rgb_anon.*'  # Matches files ending with '_rgb_anon.png' or '_rgb_anon.jpg'
-            for image_path in rgb_dir.glob(image_pattern):
-                # Construct relative path to match label
-                relative_path = image_path.relative_to(rgb_dir)
-                label_filename = image_path.name.replace('_rgb_anon', '_gt_labelIds')
-                label_path = gt_dir / relative_path.parent / label_filename
+            if not mask_dir.exists():
+                LOGGER.debug("Mask directory missing for weather '%s': %s", weather, mask_dir)
+                continue
+            if not img_dir.exists():
+                LOGGER.debug("Image directory missing for weather '%s': %s", weather, img_dir)
+                continue
+            if not ref_dir.exists():
+                LOGGER.debug("Ref image directory missing for weather '%s': %s", weather, ref_dir)
+                continue
 
-                if label_path.exists():
-                    self.image_paths.append(image_path)
-                    self.label_paths.append(label_path)
-                else:
-                    print(f"Warning: Label not found for image {image_path}")
+            seen: set[Path] = set()
 
-    @classmethod
-    def encode_target(cls, target):
-        target = np.array(target)
-        return cls.id_to_train_id[target]
+            # Prefer raw labelIds; fall back to labelTrainIds if needed.
+            label_paths = list(mask_dir.rglob(f"*{GT_LABEL_SUFFIX}"))
+            train_paths = list(mask_dir.rglob(f"*{GT_TRAIN_SUFFIX}"))
 
-    @classmethod
-    def decode_target(cls, target):
-        target[target == 255] = 19
-        return cls.train_id_to_color[target]
+            def _maybe_add(mask_path: Path) -> None:
+                rel = mask_path.relative_to(mask_dir)
+                base = rel.name.replace(GT_LABEL_SUFFIX, "").replace(GT_TRAIN_SUFFIX, "")
+                key = rel.parent / base
+                if key in seen:
+                    return
+                image_path = img_dir / rel.parent / f"{base}{IMAGE_SUFFIX}"
+                ref_image_path = ref_dir / rel.parent / f"{base}{IMAGE_REF_SUFFIX}"
 
-    def __len__(self):
-        return len(self.image_paths)
+                if not image_path.exists():
+                    LOGGER.debug("Missing image for mask %s", mask_path)
+                    return
+                if not ref_image_path.exists():
+                    LOGGER.debug("Missing ref image for mask %s", mask_path)
+                    return
 
-    def __getitem__(self, idx):
-        # Load image and label
-        img_path = self.image_paths[idx]
-        label_path = self.label_paths[idx]
+                seen.add(key)
+                samples.append(ACDCSample(image_path=image_path, mask_path=mask_path, ref_image_path=ref_image_path))
 
-        image = Image.open(img_path).convert('RGB')
-        label = Image.open(label_path)
+            for path in sorted(label_paths):
+                _maybe_add(path)
+            for path in sorted(train_paths):
+                _maybe_add(path)
 
-        # Apply transforms if any
-        if self.transform:
-            image, label = self.transform(image, label)
-        else:
-            image = torch.from_numpy(np.array(image)).float()
-            label = torch.from_numpy(np.array(label)).long()
+        return samples
 
-        label = self.encode_target(label)
-        label = torch.from_numpy(np.array(label)).long()
-        # if self.target_transform:
-        #     label = self.target_transform(label)
-        #     label = self.encode_target(label)
-        #     label = torch.from_numpy(np.array(label)).long()
-        # else:
-        #     # Convert label to tensor
-        #     label = torch.from_numpy(np.array(label)).long()
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return len(self.samples)
 
-        return image, label
+    def _encode_mask(self, mask_path: Path, mask_image: Image.Image) -> np.ndarray:
+        array = np.array(mask_image, dtype=np.int16)
+        if GT_TRAIN_SUFFIX in mask_path.name:
+            return array.astype(np.uint8)
+        return _encode_cityscapes_target(array)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample = self.samples[index]
+
+        with Image.open(sample.image_path) as img:
+            rgb_image = img.convert("RGB")
+        with Image.open(sample.ref_image_path) as ref_img:
+            ref_image = ref_img.convert("RGB")
+        with Image.open(sample.mask_path) as mask:
+            mask_image = mask.convert("L")
+
+        if self.joint_transform is not None:
+            try:
+                rgb_image, mask_image, ref_image = self.joint_transform(rgb_image, mask_image, ref_image)
+            except TypeError as exc:
+                raise TypeError("joint_transform for ACDCSegmentation must accept (image, mask, ref_image)") from exc
+
+        image_tensor = self.image_transform(rgb_image)
+        ref_tensor = self.image_transform(ref_image)
+        if not isinstance(image_tensor, torch.Tensor) or not isinstance(ref_tensor, torch.Tensor):
+            raise TypeError("image_transform must return torch.Tensor for both image and ref_image")
+
+        encoded_mask = self._encode_mask(sample.mask_path, mask_image)
+        mask_tensor = _ensure_tensor(encoded_mask).to(dtype=torch.long)
+
+        if self.target_transform is not None:
+            mask_tensor = self.target_transform(mask_tensor)
+
+        return ref_tensor, mask_tensor, image_tensor
 
 
-def get_dataloader(root_dir: str = 'data',
-                   split: str = 'train',
-                   weather: Union[str, list[str]] = 'all',
-                   transform: ExtCompose = None,
-                   batch_size: int = 4,
-                   shuffle: bool = True,
-                   num_workers: int = 4) -> DataLoader:
-    # Create the dataset
-    dataset = ACDCDataset(root_dir=root_dir, split=split, weather=weather, transform=transform)
+def build_acdc_loader(
+    root_dir: str | Path = "data/acdc",
+    split: str = "train",
+    *,
+    weather: str | Iterable[str] = "all",
+    batch_size: int = 4,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    joint_transform: Callable[[Image.Image, Image.Image, Image.Image], tuple[Image.Image, Image.Image, Image.Image]] |
+    None = None,
+    image_transform: Callable[[Image.Image], torch.Tensor] | None = None,
+    target_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> DataLoader:
+    """Build a `DataLoader` yielding (image, mask, ref_image) batches for ACDC."""
 
-    print(f"Dataset size: {len(dataset)}")
+    dataset = ACDCSegmentation(
+        root_dir=root_dir,
+        split=split,
+        weather=weather,
+        joint_transform=joint_transform,
+        image_transform=image_transform,
+        target_transform=target_transform,
+    )
 
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty. Please check the dataset path.")
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
-    # Create the DataLoader
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
-    return loader
+def _demo() -> None:
+    """Tiny sanity check that loads one batch and prints shapes/stats."""
+
+    from torchvision import transforms
+    import torchvision.transforms.functional as TF
+    from typing import Tuple
+    from gen_ddpm.sgg_sampler import MEAN, STD
+
+    def _build_acdc_transforms(image_size: int,) -> Tuple[Callable, Callable]:
+        """Resize → center-crop to a square and normalise with dataset mean/std for the DDPM."""
+
+        def joint_transform(image, mask, ref_image):
+            image = TF.resize(
+                image,
+                (image_size, image_size * 2),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            image = TF.center_crop(image, image_size)
+
+            ref_image = TF.resize(
+                ref_image,
+                (image_size, image_size * 2),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            ref_image = TF.center_crop(ref_image, image_size)
+
+            mask = TF.resize(
+                mask,
+                (image_size, image_size * 2),
+                interpolation=transforms.InterpolationMode.NEAREST,
+                antialias=False,
+            )
+            mask = TF.center_crop(mask, image_size)
+
+            return image, mask, ref_image
+
+        def image_transform(image):
+            tensor = TF.to_tensor(image)
+            return transforms.Normalize(mean=MEAN, std=STD)(tensor)
+
+        return joint_transform, image_transform
+
+    joint_transform, image_transform = _build_acdc_transforms(image_size=128)
+
+    loader = build_acdc_loader(
+        root_dir=Path("data/acdc"),
+        split="val",
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+        joint_transform=joint_transform,
+        image_transform=image_transform,
+    )
+
+    images, masks, refs = next(iter(loader))
+    LOGGER.info("Batch images shape: %s", tuple(images.shape))
+    LOGGER.info("Batch refs shape: %s", tuple(refs.shape))
+    LOGGER.info("Batch masks shape: %s", tuple(masks.shape))
+    LOGGER.info("Mask unique values: %s", torch.unique(masks))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    _demo()

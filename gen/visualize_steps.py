@@ -2,10 +2,10 @@
 Utility to visualize diffusion debug steps.
 
 Given a steps directory containing files like `step_000_t0501_image.png` and
-`step_000_t0501_mask.png` (and optionally `step_000_t0501_x0.png`), this script
-stitches all steps horizontally and plots the generated images, predicted x0
-images (if present), and their masks. Tick labels show the step index and
-timestep.
+`step_000_t0501_mask.png` (and optionally `step_000_t0501_x0.png` and
+`step_000_t0501_mask_x0.png`), this script stitches all steps horizontally and
+plots the generated images, predicted x0 images (if present), predicted masks
+from x0, and their masks. Tick labels show the step index and timestep.
 """
 
 from __future__ import annotations
@@ -20,11 +20,12 @@ import numpy as np
 from PIL import Image
 
 
-def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool, dict[str, bool]]:
+def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool, bool, dict[str, bool]]:
     pattern = re.compile(r"step_(\d+)_t(\d+)_image\.png$")
     entries = []
     presence = {
         "x0": [],
+        "mask_x0": [],
         "guidance_grad": [],
         "tr_grad": [],
         "guidance_overlay": [],
@@ -40,42 +41,44 @@ def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool, dict[str, bool]]:
         if not mask_path.exists():
             raise FileNotFoundError(f"Missing mask for {image_path.name}: {mask_path.name}")
         x0_path = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_x0.png"
+        mask_x0_path = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_mask_x0.png"
         guidance_grad = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_guidance_grad.png"
         tr_grad = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_tr_grad.png"
         guidance_overlay = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_guidance_overlay.png"
         tr_overlay = steps_dir / f"step_{match.group(1)}_t{match.group(2)}_tr_overlay.png"
 
         x0_exists = x0_path.exists()
+        mask_x0_exists = mask_x0_path.exists()
         guidance_grad_exists = guidance_grad.exists()
         tr_grad_exists = tr_grad.exists()
         guidance_overlay_exists = guidance_overlay.exists()
         tr_overlay_exists = tr_overlay.exists()
 
         presence["x0"].append(x0_exists)
+        presence["mask_x0"].append(mask_x0_exists)
         presence["guidance_grad"].append(guidance_grad_exists)
         presence["tr_grad"].append(tr_grad_exists)
         presence["guidance_overlay"].append(guidance_overlay_exists)
         presence["tr_overlay"].append(tr_overlay_exists)
-        entries.append(
-            {
-                "step": step,
-                "t": timestep,
-                "image": image_path,
-                "mask": mask_path,
-                "x0": x0_path if x0_exists else None,
-                "guidance_grad": guidance_grad if guidance_grad_exists else None,
-                "tr_grad": tr_grad if tr_grad_exists else None,
-                "guidance_overlay": guidance_overlay if guidance_overlay_exists else None,
-                "tr_overlay": tr_overlay if tr_overlay_exists else None,
-            }
-        )
+        entries.append({
+            "step": step,
+            "t": timestep,
+            "image": image_path,
+            "mask": mask_path,
+            "x0": x0_path if x0_exists else None,
+            "mask_x0": mask_x0_path if mask_x0_exists else None,
+            "guidance_grad": guidance_grad if guidance_grad_exists else None,
+            "tr_grad": tr_grad if tr_grad_exists else None,
+            "guidance_overlay": guidance_overlay if guidance_overlay_exists else None,
+            "tr_overlay": tr_overlay if tr_overlay_exists else None,
+        })
     if not entries:
         raise FileNotFoundError(f"No step_*_image.png files found in {steps_dir}")
     entries.sort(key=lambda x: x["step"])
     # Optional artifacts: allow missing; visualizer will render black tiles when absent
     availability: dict[str, bool] = {}
     for key in presence.keys():
-        if key == "x0":
+        if key in ("x0", "mask_x0"):
             continue
         availability[key] = any(entry[key] is not None for entry in entries)
 
@@ -85,7 +88,13 @@ def _parse_steps(steps_dir: Path) -> tuple[list[dict], bool, dict[str, bool]]:
         missing = [e["image"].name for e in entries if e["x0"] is None]
         raise FileNotFoundError(f"x0 files missing for steps: {', '.join(missing)}")
 
-    return entries, has_x0, availability
+    # mask_x0 remains strict: either all present or none
+    has_mask_x0 = all(presence["mask_x0"]) if presence["mask_x0"] else False
+    if any(presence["mask_x0"]) and not has_mask_x0:
+        missing = [e["image"].name for e in entries if e["mask_x0"] is None]
+        raise FileNotFoundError(f"mask_x0 files missing for steps: {', '.join(missing)}")
+
+    return entries, has_x0, has_mask_x0, availability
 
 
 def _compute_tile_height(
@@ -122,6 +131,7 @@ def build_rows(
     tile_height: int,
     *,
     include_x0: bool,
+    include_mask_x0: bool,
     include_guidance_grad: bool,
     include_tr_grad: bool,
     include_guidance_overlay: bool,
@@ -129,6 +139,7 @@ def build_rows(
 ):
     image_tiles = []
     x0_tiles = []
+    mask_x0_tiles = []
     mask_tiles = []
     guidance_grad_tiles = []
     tr_grad_tiles = []
@@ -149,6 +160,7 @@ def build_rows(
             return _load_and_resize(path, tile_height)
 
         x0_arr = _load_and_resize(entry["x0"], tile_height) if include_x0 else None
+        mask_x0_arr = _load_and_resize(entry["mask_x0"], tile_height) if include_mask_x0 else None
         guidance_grad_arr = _load_optional(entry["guidance_grad"]) if include_guidance_grad else None
         tr_grad_arr = _load_optional(entry["tr_grad"]) if include_tr_grad else None
         guidance_overlay_arr = _load_optional(entry["guidance_overlay"]) if include_guidance_overlay else None
@@ -162,6 +174,8 @@ def build_rows(
         image_tiles.append(image_arr)
         if include_x0:
             x0_tiles.append(x0_arr)
+        if include_mask_x0:
+            mask_x0_tiles.append(mask_x0_arr)
         mask_tiles.append(mask_arr)
         if include_guidance_grad:
             guidance_grad_tiles.append(guidance_grad_arr)
@@ -175,6 +189,8 @@ def build_rows(
     rows = [("Images", np.concatenate(image_tiles, axis=1))]
     if include_x0:
         rows.append(("x0", np.concatenate(x0_tiles, axis=1)))
+    if include_mask_x0:
+        rows.append(("Mask x0", np.concatenate(mask_x0_tiles, axis=1)))
     if include_guidance_grad:
         rows.append(("Guidance grad", np.concatenate(guidance_grad_tiles, axis=1)))
     if include_tr_grad:
@@ -183,6 +199,7 @@ def build_rows(
         rows.append(("Guidance overlay", np.concatenate(guidance_overlay_tiles, axis=1)))
     if include_tr_overlay:
         rows.append(("TR overlay", np.concatenate(tr_overlay_tiles, axis=1)))
+
     rows.append(("Masks", np.concatenate(mask_tiles, axis=1)))
     return rows, xtick_positions, xtick_labels
 
@@ -226,7 +243,9 @@ def plot_steps(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize step debug images, predicted x0, masks, and gradients.")
+    parser = argparse.ArgumentParser(
+        description="Visualize step debug images, predicted x0, predicted mask x0, masks, and gradients."
+    )
     parser.add_argument("steps_dir", type=Path, help="Path to steps directory (contains step_*_image.png files).")
     parser.add_argument(
         "--output",
@@ -249,13 +268,14 @@ def main() -> None:
     if not steps_dir.exists():
         raise FileNotFoundError(f"Steps directory not found: {steps_dir}")
 
-    entries, has_x0, availability = _parse_steps(steps_dir)
+    entries, has_x0, has_mask_x0, availability = _parse_steps(steps_dir)
     tile_height = _compute_tile_height(entries, args.tile_height, args.max_width)
 
     rows, xtick_positions, xtick_labels = build_rows(
         entries,
         tile_height,
         include_x0=has_x0,
+        include_mask_x0=has_mask_x0,
         include_guidance_grad=availability.get("guidance_grad", False),
         include_tr_grad=availability.get("tr_grad", False),
         include_guidance_overlay=availability.get("guidance_overlay", False),
