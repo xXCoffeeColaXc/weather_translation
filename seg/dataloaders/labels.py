@@ -121,7 +121,7 @@ CLASS_WEIGHT_MAP = {
     11: 0.5,  # person
     12: 0.5,  # rider
     13: 3.0,  # car
-    14: 3.0,  # truck
+    14: 1.0,  # truck
     15: 3.0,  # bus
     16: 0.0,  # train
     17: 0.2,  # motorcycle

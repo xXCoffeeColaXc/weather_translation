@@ -175,4 +175,15 @@ python scripts/save_translation_panel.py \
         lindau_000004_000019_leftImg8bit \
         munster_000025_000019_leftImg8bit \
     --output eval/translation_quantitative_semantic_consistency/fog2/fog2_panel.png
+
+python scripts/save_translation_panel.py \
+    eval/ddpm_translation_consistency/all_ddpm \
+        frankfurt_000000_002963 \
+        frankfurt_000000_009688 \
+        frankfurt_000000_013382 \
+        lindau_000004_000019 \
+        lindau_000013_000019 \
+        lindau_000047_000019 \
+        munster_000009_000019 \
+    --output eval/ddpm_translation_consistency/all_ddpm/all_ddpm_panel.png
 '''

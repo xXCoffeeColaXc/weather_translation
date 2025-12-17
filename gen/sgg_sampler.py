@@ -37,9 +37,9 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-test_sample = "munster_000019_000019_leftImg8bit"
+test_sample = "frankfurt_000000_013382_leftImg8bit"
 
-OUTDIR = f"eval_night/cherrypicked_{test_sample}_01"
+OUTDIR = f"eval_night/cherrypicked_{test_sample}_without_lora"
 INVERTED_LATENTS_PATH = f"{test_sample}_inverted_no_blue_sky_prompt.pt"
 # CONDITION = "rain"
 
@@ -76,7 +76,7 @@ NEG = ("clear sky, sunny or bright daylight, crisp visibility, blue sky, sunbeam
 SIZE = (512, 512)
 
 STEPS = 100
-STRENGTH = 0.7
+STRENGTH = 0.75
 CFG = 7.5
 
 GUIDE_START, GUIDE_END = 0.0, 1.0
@@ -85,15 +85,15 @@ GUIDE_BLUR_SIGMA = 0.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 18]
 GUIDE_TV_WEIGHT = 0.01
 
-TEMPERATURE = 1.0
-LAMBDA_TR = 0.2
+TEMPERATURE = 1.1
+LAMBDA_TR = 0.5
 
 PROTECTED_CLASSES = {
-    11: 0.01,  # person,
+    11: 0.1,  # person,
     12: 0.1,  # rider
     18: 0.1,  # bicycle
-    13: 0.01,  # car
-    14: 0.01,  # truck
+    13: 0.1,  # car
+    14: 0.1,  # truck
     6: 0.1,  # traffic light
     7: 0.1,  # traffic sign
 }
@@ -101,11 +101,11 @@ PROTECTED_CLASSES = {
 
 GRAD_EPS = 1e-8
 LOSS_TYPE = "blend"  # "ce" or "kl" or "blend"
-BLEND_WEIGHT = 0.8
+BLEND_WEIGHT = 0.1
 CALLBACK_INTERVAL = 10
 PRED_ON_X0_HAT = True
 MODE = "alternate"  # "gsg" or "lcg" or "alternate"
-GRAD_CLIP_NORM = 1.0  # e.g., 5.0 to clip by global norm
+GRAD_CLIP_NORM = 1.5  # e.g., 5.0 to clip by global norm
 GRAD_CLIP_VALUE = None  # e.g., 0.2 to clamp elementwise
 
 
@@ -1266,12 +1266,12 @@ def main(
 
     teacher_bundle = load_hf_model(teacher_model, device=str(device))
 
-    # pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL,
-    #                                                       torch_dtype=torch_dtype,
-    #                                                       safety_checker=None,
-    #                                                       use_auth_token=HF_TOKEN)
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(MODEL,
+                                                          torch_dtype=torch_dtype,
+                                                          safety_checker=None,
+                                                          use_auth_token=HF_TOKEN)
 
-    pipe = load_finetuned_pipeline(device, dtype=torch_dtype)
+    # pipe = load_finetuned_pipeline(device, dtype=torch_dtype)
 
     try:
         pipe.enable_xformers_memory_efficient_attention()

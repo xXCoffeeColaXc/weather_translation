@@ -35,7 +35,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MEAN, STD = [0.4865, 0.4998, 0.4323], [0.2326, 0.2276, 0.2659]
 
-OUTDIR = "gen_ddpm/ddpm_final_experiments/benchmark_002"
+OUTDIR = "gen_ddpm/ddpm_final_experiments/benchmark_005"
 
 input_paths = [
     "frankfurt_000000_002963_leftImg8bit",
@@ -60,11 +60,10 @@ GUIDE_CLASS_WEIGHTS = {
     9: 1.0,  # terrain
     10: 1.0,  # sky
 }
-GUIDE_CLASS_WEIGHTS = None
 TEMPERATURE = 1.0
 LOSS_TYPE = "ce"
 BLEND_WEIGHT = 0.1
-PRED_ON_X0_HAT = False
+PRED_ON_X0_HAT = True
 STEPS = 400
 MODE = "alternate"
 GRAD_CLIP_NORM: Optional[float] = 1.5  # clip gradients by global norm if set
@@ -265,9 +264,8 @@ def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
         if step.predicted_without_guidance is not None:
             save_01(step.predicted_without_guidance, steps_dir / f"{suffix}_image_wo_guidance.png")
         if step.predicted_mask_without_guidance is not None:
-            mask_to_color(step.predicted_mask_without_guidance[0].cpu()).save(
-                steps_dir / f"{suffix}_mask_wo_guidance.png"
-            )
+            mask_to_color(step.predicted_mask_without_guidance[0].cpu()).save(steps_dir /
+                                                                              f"{suffix}_mask_wo_guidance.png")
 
         if step.guidance_heatmap is not None:
             save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
