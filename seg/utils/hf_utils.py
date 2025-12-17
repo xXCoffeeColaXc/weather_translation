@@ -14,6 +14,8 @@ MODEL_ZOO: Dict[str, str] = {
     "segformer_b0": "nvidia/segformer-b0-finetuned-cityscapes-1024-1024",
     "segformer_b1": "nvidia/segformer-b1-finetuned-cityscapes-1024-1024",
     "segformer_b2": "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
+    "segformer_b3": "nvidia/segformer-b3-finetuned-cityscapes-1024-1024",
+    "segformer_b4": "nvidia/segformer-b4-finetuned-cityscapes-1024-1024",
     "segformer_b5": "nvidia/segformer-b5-finetuned-cityscapes-1024-1024",
 }
 

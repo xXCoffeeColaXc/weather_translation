@@ -35,30 +35,27 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MEAN, STD = [0.4865, 0.4998, 0.4323], [0.2326, 0.2276, 0.2659]
 
-OUTDIR = "gen_ddpm/ddpm_sgg_samples/experiment_sgg2_no"
+OUTDIR = "gen_ddpm/ddpm_final_experiments/benchmark_002"
 
-GUIDE_LAMBDA = 40.0
-GUIDE_START = 2.0
+GUIDE_LAMBDA = 5.0
+GUIDE_START = 0.0
 GUIDE_END = 1.0
-GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13, 18]
-# GUIDE_CLASS_WEIGHTS = {
-#     13: 3.0,  # car
-#     0: 2.0,  # road
-#     2: 1.0,  # building
-#     1: 1.0,  # sidewalk
-#     8: 1.5,  # vegetation
-#     9: 1.0,  # terrain
-#     10: 1.0,  # sky
-#     11: 0.5,  # person
-#     12: 0.5,  # rider
-#     18: 0.5,  # bicycle
-# }
+GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 13, 14]
+GUIDE_CLASS_WEIGHTS = {
+    13: 3.0,  # car
+    0: 2.0,  # road
+    2: 1.0,  # building
+    1: 1.0,  # sidewalk
+    8: 1.5,  # vegetation
+    9: 1.0,  # terrain
+    10: 1.0,  # sky
+}
 GUIDE_CLASS_WEIGHTS = None
 TEMPERATURE = 1.5
-LOSS_TYPE = "ce"
-BLEND_WEIGHT = 0.8
-PRED_ON_X0_HAT = False
-STEPS = 300
+LOSS_TYPE = "blend"
+BLEND_WEIGHT = 0.7
+PRED_ON_X0_HAT = True
+STEPS = 500
 MODE = "alternate"
 GRAD_CLIP_NORM: Optional[float] = 5.0  # clip gradients by global norm if set
 GRAD_CLIP_VALUE: Optional[float] = None  # clamp elementwise if set
@@ -75,6 +72,8 @@ class StepOutput:
     decoded_x0_image: torch.Tensor
     predicted_mask: torch.Tensor
     predicted_mask_x0: torch.Tensor
+    predicted_without_guidance: Optional[torch.Tensor] = None
+    predicted_mask_without_guidance: Optional[torch.Tensor] = None
     guidance_heatmap: Optional[torch.Tensor] = None
     tr_heatmap: Optional[torch.Tensor] = None
     guidance_overlay: Optional[torch.Tensor] = None
@@ -84,12 +83,12 @@ class StepOutput:
 @dataclass
 class SamplerConfig:
     # data
-    dataset_root: str = "data/acdc"  # "data/cityscapes"
-    split: str = "train"
+    dataset_root: str = "data/cityscapes"  # "data/cityscapes"
+    split: str = "val"
     image_size: int = 128
     batch_size: int = 1
     num_workers: int = 4
-    max_samples: Optional[int] = 1
+    max_samples: Optional[int] = 20
 
     # diffusion
     diffusion_steps: int = STEPS  # how many forward steps to apply before reversing
@@ -119,7 +118,7 @@ class SamplerConfig:
 
     # logging
     output_dir: str = OUTDIR
-    log_every: Optional[int] = 50
+    log_every: Optional[int] = None
     sanity_check: bool = False
 
 
@@ -247,6 +246,9 @@ def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
 
         mask_to_color(step.predicted_mask[0]).save(steps_dir / f"{suffix}_mask.png")
         mask_to_color(step.predicted_mask_x0[0]).save(steps_dir / f"{suffix}_mask_x0.png")
+
+        save_01(step.predicted_without_guidance, steps_dir / f"{suffix}_image_wo_guidance.png")
+        mask_to_color(step.predicted_mask_without_guidance[0]).save(steps_dir / f"{suffix}_mask_wo_guidance.png")
 
         if step.guidance_heatmap is not None:
             save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
@@ -436,35 +438,35 @@ def apply_segmentation_guidance(
         return x_t.detach(), torch.tensor(0.0, device=x_t.device)
 
     #Gradient of loss w.r.t *x_t*
-    grad_x = torch.autograd.grad(
-        loss,
-        x_var,
-        retain_graph=False,
-        create_graph=False,
-    )[0]
-
     # grad_x = torch.autograd.grad(
     #     loss,
-    #     sr_image,
+    #     x_var,
     #     retain_graph=False,
     #     create_graph=False,
     # )[0]
-    # grad_x = F.interpolate(
-    #     grad_x,
-    #     size=(128, 128),
-    #     mode="bilinear",
-    #     align_corners=False,
-    # )
 
-    # grad_x_clipped, grad_norm = _clip_gradient(
-    #     grad_x,
-    #     max_norm=grad_clip_norm,
-    #     max_value=grad_clip_value,
-    #     eps=grad_eps,
-    # )
+    grad_x = torch.autograd.grad(
+        loss,
+        sr_image,
+        retain_graph=False,
+        create_graph=False,
+    )[0]
+    grad_x = F.interpolate(
+        grad_x,
+        size=(128, 128),
+        mode="bilinear",
+        align_corners=False,
+    )
 
-    grad_x_clipped = grad_x
-    grad_norm = float(torch.linalg.norm(grad_x_clipped).detach().cpu())
+    grad_x_clipped, grad_norm = _clip_gradient(
+        grad_x,
+        max_norm=grad_clip_norm,
+        max_value=grad_clip_value,
+        eps=grad_eps,
+    )
+
+    # grad_x_clipped = grad_x
+    # grad_norm = float(torch.linalg.norm(grad_x_clipped).detach().cpu())
 
     # Gradient descent on the semantic loss (move towards *lower* CE/NLL/KL)
     guided = x_var - guidance_lr_t * grad_x_clipped
@@ -497,34 +499,34 @@ def load_srgan(checkpoint: str, device: torch.device) -> Generator:
     return srgan
 
 
-def build_loader(config: SamplerConfig) -> tuple[ACDCSegmentation, DataLoader]:
-    #joint_transform, image_transform = _build_cityscapes_transforms(config.image_size)
+def build_loader(config: SamplerConfig) -> tuple[CityscapesSegmentation, DataLoader]:
+    joint_transform, image_transform = _build_cityscapes_transforms(config.image_size)
 
-    joint_transform, image_transform = _build_acdc_transforms(image_size=config.image_size)
+    #joint_transform, image_transform = _build_acdc_transforms(image_size=config.image_size)
 
-    loader = build_acdc_loader(
-        root_dir=config.dataset_root,
-        split=config.split,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        joint_transform=joint_transform,
-        image_transform=image_transform,
-    )
-
-    # dataset = CityscapesSegmentation(
+    # loader = build_acdc_loader(
     #     root_dir=config.dataset_root,
     #     split=config.split,
-    #     joint_transform=joint_transform,
-    #     image_transform=image_transform,
-    # )
-    # loader = DataLoader(
-    #     dataset,
     #     batch_size=config.batch_size,
     #     shuffle=False,
     #     num_workers=config.num_workers,
-    #     pin_memory=DEVICE.type == "cuda",
+    #     joint_transform=joint_transform,
+    #     image_transform=image_transform,
     # )
+
+    dataset = CityscapesSegmentation(
+        root_dir=config.dataset_root,
+        split=config.split,
+        joint_transform=joint_transform,
+        image_transform=image_transform,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=DEVICE.type == "cuda",
+    )
     return loader.dataset, loader
 
 
@@ -578,6 +580,7 @@ def reverse_denoise(
     Guidance is always applied to x_t, even if the teacher predicts on x0_hat.
     """
     x = xt
+    x_wo_guidance = xt.clone()
     total_steps = steps
     steps_to_run = steps
     denom = max(1, steps_to_run - 1)
@@ -597,6 +600,7 @@ def reverse_denoise(
         # Noise prediction on current x_t (no gradients needed here).
         with torch.no_grad():
             eps_xt = model(x, t_embed)
+            eps_xt_wo_guidance = model(x_wo_guidance, t_embed)
 
         # Guidance schedule: stronger at later, cleaner steps (small t).
         # sqrt_alpha_bar is ~1 at t=0 (clean), and small at large t (noisy).
@@ -662,6 +666,15 @@ def reverse_denoise(
                 )
                 pred_mask_x0 = logits_x0.argmax(dim=1)
 
+                # Also run teacher on unguided x_t for comparison
+                sr_image_wo_guidance = srgan(_denormalize_to_01(x_wo_guidance))
+                logits = compute_teacher_logits(
+                    sr_image_wo_guidance,
+                    teacher_bundle,
+                    target_size=sr_image_wo_guidance.shape[-2:],
+                )
+                pred_mask_wo_guidance = logits.argmax(dim=1)
+
                 step_logger(
                     StepOutput(
                         step_index=idx,
@@ -672,12 +685,17 @@ def reverse_denoise(
                         decoded_x0_image=x0_image,
                         predicted_mask=pred_mask,
                         predicted_mask_x0=pred_mask_x0,
+                        predicted_without_guidance=x_wo_guidance,
+                        predicted_mask_without_guidance=pred_mask_wo_guidance,
                     ))
 
             mean, sigma = scheduler.sample_prev_timestep2(x, eps_guided, t)
             x = mean if step == 0 else mean + sigma
 
-    return x
+            mean_wo, sigma_wo = scheduler.sample_prev_timestep2(x_wo_guidance, eps_xt_wo_guidance, t)
+            x_wo_guidance = mean_wo if step == 0 else mean_wo + sigma_wo
+
+    return x, x_wo_guidance
 
 
 def run_pipeline(
@@ -717,7 +735,7 @@ def run_pipeline(
 
     noised = forward_diffuse(image_batch, scheduler, steps, log_every=log_every)
 
-    denoised = reverse_denoise(
+    denoised, denoised_wo_guidance = reverse_denoise(
         noised,
         model,
         scheduler,
@@ -743,7 +761,7 @@ def run_pipeline(
         step_logger=step_logger,
     )
 
-    return noised, denoised
+    return noised, denoised, denoised_wo_guidance
 
 
 def save_outputs(
@@ -753,19 +771,23 @@ def save_outputs(
     original: torch.Tensor,
     sr_original: torch.Tensor,
     sr_denoised: torch.Tensor,
+    sr_denoised_wo_guidance: torch.Tensor,
     sr_pred_mask: torch.Tensor,
+    sr_pred_mask_wo: torch.Tensor,
     mask: torch.Tensor,
-    ref_image: torch.Tensor,
+    # ref_image: torch.Tensor,
     noised: torch.Tensor,
     denoised: torch.Tensor,
     final_timestep: int,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _save_batch_image(original, out_dir / f"{base_name}_orig.png")
-    _save_batch_image(ref_image, out_dir / f"{base_name}_ref.png")
+    # _save_batch_image(ref_image, out_dir / f"{base_name}_ref.png")
     save_01(sr_original, out_dir / f"{base_name}_sr_orig.png")
     save_01(sr_denoised, out_dir / f"{base_name}_sr_denoised.png")
     mask_to_color(sr_pred_mask[0]).save(out_dir / f"{base_name}_sr_pred_mask.png")
+    save_01(sr_denoised_wo_guidance, out_dir / f"{base_name}_sr_denoised_wo_guidance.png")
+    mask_to_color(sr_pred_mask_wo[0]).save(out_dir / f"{base_name}_sr_pred_mask_wo_guidance.png")
     mask_to_color(mask[0]).save(out_dir / f"{base_name}_mask.png")
     _save_batch_image(denoised, out_dir / f"{base_name}_denoised.png")
 
@@ -809,7 +831,7 @@ def main() -> None:
 
     sample_counter = 0
 
-    for batch_idx, (batch_images, batch_masks, batch_ref_images) in enumerate(loader):
+    for batch_idx, (batch_images, batch_masks) in enumerate(loader):
         batch_images = batch_images.to(device=DEVICE, dtype=torch.float32)
         batch_masks = batch_masks.to(device=DEVICE)
         batch_size = batch_images.size(0)
@@ -823,22 +845,27 @@ def main() -> None:
 
         image = batch_images[rand_idx:rand_idx + 1]
         mask = batch_masks[rand_idx:rand_idx + 1]
-        ref_image = batch_ref_images[rand_idx:rand_idx + 1]
+        # ref_image = batch_ref_images[rand_idx:rand_idx + 1]
 
         dataset_idx = min(
             len(dataset.samples) - 1,
             batch_idx * config.batch_size + rand_idx,
         )
         sample_info = dataset.samples[dataset_idx]
-        relative = Path(sample_info.image_path).parent.relative_to(dataset.rgb_root)
+        # relative = Path(sample_info.image_path).relative_to(dataset.rgb_root).with_suffix("")
 
-        sample_dir = output_root / relative
+        # sample_dir = output_root / relative
+        # sample_dir.mkdir(parents=True, exist_ok=True)
+        # base_name = relative.stem
+        relative = sample_info.image_path.relative_to(dataset.left_dir)
+
+        sample_dir = output_root / relative.parent
         sample_dir.mkdir(parents=True, exist_ok=True)
-        base_name = relative.stem
+        base_name = relative.stem.replace("_leftImg8bit", "")
 
         step_logger = build_step_logger(sample_dir / "steps") if config.log_every else None
 
-        noised, denoised = run_pipeline(
+        noised, denoised, denoised_wo_guidance = run_pipeline(
             model,
             scheduler,
             image,
@@ -865,6 +892,7 @@ def main() -> None:
 
         sr_original = srgan(_denormalize_to_01(image))
         sr_denoised = srgan(_denormalize_to_01(denoised))
+        sr_denoised_wo_guidance = srgan(_denormalize_to_01(denoised_wo_guidance))
 
         with torch.no_grad():
             sr_pred_logits = compute_teacher_logits(
@@ -874,17 +902,26 @@ def main() -> None:
             )
             sr_pred_mask = sr_pred_logits.argmax(dim=1)
 
+            sr_pred_logits_wo = compute_teacher_logits(
+                sr_denoised_wo_guidance,
+                teacher_bundle,
+                target_size=sr_denoised_wo_guidance.shape[-2:],
+            )
+            sr_pred_mask_wo = sr_pred_logits_wo.argmax(dim=1)
+
         save_outputs(
             sample_dir,
             base_name=base_name,
             original=image.cpu(),
-            ref_image=ref_image.cpu(),
+            # ref_image=ref_image.cpu(),
             sr_original=sr_original.cpu(),
             mask=mask.cpu(),
             sr_pred_mask=sr_pred_mask.cpu(),
+            sr_pred_mask_wo=sr_pred_mask_wo.cpu(),
             noised=noised.cpu(),
             denoised=denoised.cpu(),
             sr_denoised=sr_denoised.cpu(),
+            sr_denoised_wo_guidance=sr_denoised_wo_guidance.cpu(),
             final_timestep=config.diffusion_steps - 1,
         )
 

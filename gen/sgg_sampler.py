@@ -26,6 +26,7 @@ from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionMod
 from gen.val_sd import _select_dtype, _load_component_if_exists
 
 from seg.dataloaders.cityscapes import CityscapesSegmentation, IGNORE_LABEL
+from seg.dataloaders.labels import CLASS_WEIGHT_MAP as GUIDE_CLASS_WEIGHTS
 from seg.infer import ModelBundle, build_cityscapes_dataloader, load_hf_model
 from seg.utils.hf_utils import build_joint_randomresizedcrop, tensor_to_pil, mask_to_color
 
@@ -35,56 +36,76 @@ MODEL = "runwayml/stable-diffusion-v1-5"
 #MODEL = "stabilityai/stable-diffusion-3.5-medium"  # Alternative SD 3.5 medium
 TEACHER_MODEL = "nvidia/segformer-b3-finetuned-cityscapes-1024-1024"  # "segformer_b5"
 HF_TOKEN = os.environ.get("HF_TOKEN")
-OUTDIR = "eval_city/benchmark_z_city_001"
-INVERTED_LATENTS_PATH = "munster_000009_000019_leftImg8bit_inverted_latents_sunny_prompt.pt"  # "munster_000009_000019_leftImg8bit_inverted_latents_no_prompt.pt"
+
+test_sample = "munster_000019_000019_leftImg8bit"
+
+OUTDIR = f"eval_night/cherrypicked_{test_sample}_01"
+INVERTED_LATENTS_PATH = f"{test_sample}_inverted_no_blue_sky_prompt.pt"
 # CONDITION = "rain"
-# PROMPT = f"autonomous driving scene at {CONDITION}, cinematic, detailed, wet asphalt reflections"
-# PROMPT = "urban driving scene during rain, realistic and detailed with visible vehicles."
-#PROMPT = "autonomous driving scene at fog, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
-PROMPT = "autonomous driving scene at rain, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, car, person in a urban setting."
-NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors"
+
+PROMPT = ("autonomous driving dashcam view at night, pitch-black moonless sky over a realistic urban street, dim "
+          "warm-orange streetlamps casting soft pools of light, car headlights and taillights with natural falloff and "
+          "subtle bloom, damp asphalt with crisp lane markings and gentle reflections (no rain falling), dark muted "
+          "facades with sparse shopfront glow, silhouetted trees and shrubs, cinematic contrast, razor-sharp "
+          "photoreal detail")
+# PROMPT = ("ultra-detailed photorealistic rainy urban driving scene, heavy rain falling, wet reflective asphalt with "
+#           "glistening puddles, realistic raindrop streaks on the lens, diffused headlights and taillights reflecting "
+#           "on the road, muted colors, soft building and tree silhouettes in moody atmosphere "
+#           "low visibility, atmospheric fog, cinematic lighting, photorealistic")
+#PROMPT = "ultra-detailed high-resolution rainy urban driving scene, low visibility, wet reflective asphalt, glistening puddles, cinematic lighting, realistic cars, atmospheric fog, moody reflections, photorealistic"
+# PROMPT = ("ultra-detailed photorealistic urban driving scene in dense fog, extremely low visibility, "
+#           "diffused headlights and taillights glowing through mist, muted colors, soft silhouettes of "
+#           "buildings and trees, damp reflective asphalt with faint markings, cinematic hazy atmosphere")
+# PROMPT = "autonomous driving scene at night, pitch-black night sky, dim warm-orange streetlamps casting soft pools of light, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, cars, in a urban setting. "
+# PROMPT = "autonomous driving scene at night, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, cars, in a urban setting. "
+# PROMPT = "pitch-black night sky over a realistic urban street, dim warm-orange streetlamps casting soft pools of light, car headlights and taillights on with natural falloff, dark muted building facades, sparse shopfront glow, subtle reflections on asphalt, damp pavement but not raining, defined road markings, natural trees and shrubs in shadowed tones, cinematic contrast, sharp realistic detail"
+# PROMPT = "ultra-detailed high-resolution rainy urban driving scene, low visibility, wet reflective asphalt, glistening puddles, cinematic lighting, realistic cars, atmospheric fog, moody reflections, photorealistic"
+# NEG = "blurry, unnatural, cartoon, oversaturated, low detail, distorted cars, grainy, lens flare halos, blown highlights, unrealistic colors, poorly defined reflections, noisy textures, messy edges, low contrast, muddy shadows, deformed faces, strange artifacts, jagged outlines, unnatural lighting"
+NEG = ("clear sky, sunny or bright daylight, crisp visibility, blue sky, sunbeams, dry road, snow, falling rain, "
+       "oversaturated, cartoon, low detail, motion blur, distortion, blown highlights, harsh shadows, color banding, "
+       "lens flare halos, noisy textures, muddy shadows, warped edges, unnatural lighting, artifacts, traffic lights "
+       "floating in the sky, streetlights floating in the sky, lights in the sky")
+# NEG = ("clear sky, sunny or bright daylight, crisp visibility, dry road, snow, oversaturated, cartoon, low detail, "
+#        "distorted cars, blown highlights, strong contrast, color banding, lens flare halos, noisy textures, muddy "
+#        "shadows, warped edges, unnatural lighting, artifacts, traffic lights floating in the sky, streetlights "
+#        "floating in the sky, lights in the sky")
+# NEG = ("clear sky, sunny or bright daylight, crisp visibility, dry road, rain, snow, oversaturated, "
+#        "cartoon, low detail, distorted cars, blown highlights, strong contrast, color banding, lens "
+#        "flare halos, noisy textures, muddy shadows, warped edges, unnatural lighting, artifacts, "
+#        "traffic lights floating in the sky, streetlights floating in the sky, lights in the sky")
 SIZE = (512, 512)
 
 STEPS = 100
-STRENGTH = 0.5
+STRENGTH = 0.7
 CFG = 7.5
 
 GUIDE_START, GUIDE_END = 0.0, 1.0
-GUIDE_LAMBDA = 10.0
+GUIDE_LAMBDA = 5.0
 GUIDE_BLUR_SIGMA = 0.0
-GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13,
-                         18]  # road, sidewalk, building, vegetation, terrain, sky, rider, car, bycicle
-GUIDE_CLASS_WEIGHTS = {
-    13: 3.0,  # car
-    0: 2.0,  # road
-    2: 1.0,  # building
-    1: 1.0,  # sidewalk
-    8: 1.0,  # vegetation
-    9: 1.0,  # terrain
-    10: 1.0,  # sky
-    11: 0.5,  # person
-    12: 0.5,  # rider
-    18: 0.5,  # bicycle
-}
+GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 18]
 GUIDE_TV_WEIGHT = 0.01
 
 TEMPERATURE = 1.0
-LAMBDA_TR = 0.25
+LAMBDA_TR = 0.2
 
 PROTECTED_CLASSES = {
-    11: 0.1,  # person,
+    11: 0.01,  # person,
     12: 0.1,  # rider
-    13: 0.1,  # car
+    18: 0.1,  # bicycle
+    13: 0.01,  # car
+    14: 0.01,  # truck
+    6: 0.1,  # traffic light
+    7: 0.1,  # traffic sign
 }
 # PROTECTED_CLASSES = {}
 
 GRAD_EPS = 1e-8
-LOSS_TYPE = "ce"  # "ce" or "kl" or "blend"
-BLEND_WEIGHT = 0.7
-CALLBACK_INTERVAL = 5
+LOSS_TYPE = "blend"  # "ce" or "kl" or "blend"
+BLEND_WEIGHT = 0.8
+CALLBACK_INTERVAL = 10
 PRED_ON_X0_HAT = True
 MODE = "alternate"  # "gsg" or "lcg" or "alternate"
-GRAD_CLIP_NORM = 4  # e.g., 5.0 to clip by global norm
+GRAD_CLIP_NORM = 1.0  # e.g., 5.0 to clip by global norm
 GRAD_CLIP_VALUE = None  # e.g., 0.2 to clamp elementwise
 
 
@@ -488,7 +509,9 @@ def predict_mask_from_image(
     *,
     target_size: Tuple[int, int],
 ) -> torch.Tensor:
-    logits = compute_teacher_logits(image_batch, bundle, target_size=target_size)
+    # No gradients needed when we only want masks for logging.
+    with torch.inference_mode():
+        logits = compute_teacher_logits(image_batch, bundle, target_size=target_size)
     return logits.argmax(dim=1)
 
 
@@ -894,14 +917,16 @@ def invert(
     latents,
     device,
     torch_dtype,
-    guidance_scale=CFG,
+    guidance_scale=3.0,
     num_inference_steps=STEPS,
     do_classifier_free_guidance=True,
 ):
     # change prompt to be sunny:
-    SUNNY_PROMPT = PROMPT.replace("rain",
-                                  "sunny clear day").replace("fog",
-                                                             "sunny clear day").replace("night", "sunny clear day")
+    # SUNNY_PROMPT = PROMPT.replace("rain",
+    #                               "sunny clear day").replace("fog",
+    #                                                          "sunny clear day").replace("night", "sunny clear day")
+    SUNNY_PROMPT = "A high resolution photo of a clear day in a city, detailed"
+    # SUNNY_PROMPT = "autonomous driving scene at sunny clear day, realistic, detailed, road and surroundings visible. Scene contains sidewalk, building, cars, in a urban setting."  # "Autonomous vehicle driving in a clear city environment"  # "A high resolution photo of a clear day in a city, detailed"
     prompt_tokens = pipe.tokenizer(
         SUNNY_PROMPT,
         padding="max_length",
@@ -910,7 +935,7 @@ def invert(
         return_tensors="pt",
     )
     negative_tokens = pipe.tokenizer(
-        NEG,
+        "",
         padding="max_length",
         max_length=pipe.tokenizer.model_max_length,
         truncation=True,
@@ -944,8 +969,9 @@ def invert(
         latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
 
         # Predict the noise residual
-        with _maybe_autocast(device.type, torch_dtype):
-            noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+        with torch.no_grad():
+            with _maybe_autocast(device.type, torch_dtype):
+                noise_pred = pipe.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
         # Perform guidance
         if do_classifier_free_guidance:
@@ -988,8 +1014,10 @@ def run_single_sample(
         inverted_latents_path = Path(config.inverted_latents_path)
 
         if inverted_latents_path.exists():
+            print(f" Loading cached inverted latents from {inverted_latents_path}")
             inverted_latents = torch.load(inverted_latents_path, map_location=device)
         else:
+            print(f" Inverting and caching latents to {inverted_latents_path}")
             init_latents = _encode_init_latents(pipe, image_pil, device=device, torch_dtype=torch_dtype)
             inversion_steps = int(config.steps)
             inverted_latents = invert(pipe,
@@ -1050,11 +1078,13 @@ def run_single_sample(
         #    duplicate latents for [uncond, cond]; predict eps_uncond, eps_text; mix with cfg.
         latent_input = torch.cat([latents, latents], dim=0)
         latent_input = pipe.scheduler.scale_model_input(latent_input, timestep)
-        with _maybe_autocast(device.type, torch_dtype):
-            noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
-            noise_uncond, noise_text = noise_pred.chunk(2)
-            noise_pred = noise_uncond + (config.cfg * weights_latent) * (noise_text - noise_uncond)
-            noise_pred_for_sgg = noise_pred.detach()
+        # UNet is frozen; avoid storing activations/grad history to save VRAM.
+        with torch.no_grad():
+            with _maybe_autocast(device.type, torch_dtype):
+                noise_pred = pipe.unet(latent_input, timestep, encoder_hidden_states=text_context).sample
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_pred = noise_uncond + (config.cfg * weights_latent) * (noise_text - noise_uncond)
+                noise_pred_for_sgg = noise_pred.detach()
 
         latents_next, pred_original_latents = _scheduler_step_with_x0(pipe.scheduler, latents, timestep, noise_pred)
 
@@ -1216,7 +1246,7 @@ def main(
     out_dir: str | Path = OUTDIR,
     *,
     teacher_model: str = TEACHER_MODEL,
-    max_samples: Optional[int] = 3,
+    max_samples: Optional[int] = 20,
     num_workers: int = 1,
     seed: Optional[int] = 42,
     config: Optional[SamplerConfig] = None,
@@ -1277,7 +1307,7 @@ def main(
         split,
         sampler_config.size,
         batch_size=1,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=device.type == "cuda",
     )
 
@@ -1301,18 +1331,24 @@ def main(
             neg_embeds = pipe.text_encoder(negative_tokens.input_ids.to(device))[0]
     text_context = torch.cat([neg_embeds, pos_embeds], dim=0)
 
+    print(f"{len(loader)}" + " samples to process.")
     total_steps = len(loader) if max_samples is None else min(len(loader), max_samples)
     for idx, (images, masks) in enumerate(loader):
         if idx >= total_steps:
             break
 
-        if idx != 2:
-            continue
+        global_idx = idx * loader.batch_size
+        print(f"Processing sample index {global_idx}")
+        # if 13 > global_idx:
+        #     continue
 
         sample_info = dataset.samples[idx]
         relative_path = sample_info.image_path.relative_to(dataset.left_dir)
         output_path = output_root / relative_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not output_path.stem == test_sample:
+            continue
 
         # If no custom callback was provided but a logging interval was, attach a simple logger that
         # saves intermediate decoded images and teacher masks.
@@ -1334,6 +1370,9 @@ def main(
         config_path = output_path.with_name(output_path.stem + "_config.json")
         with open(config_path, "w") as f:
             json.dump(asdict(sampler_config), f, indent=4)
+
+        # sampler_config.inverted_latents_path = output_path.with_name(output_path.stem +
+        #                                                              "_inverted_latents.pt").as_posix()
 
         decoded_01, sgg_log = run_single_sample(
             pipe,

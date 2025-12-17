@@ -104,3 +104,26 @@ def get_train_ids():
         if not i.ignoreInEval:
             train_ids.append(i.id)
     return train_ids
+
+
+CLASS_WEIGHT_MAP = {
+    0: 1.5,  # road
+    1: 1.5,  # sidewalk
+    2: 1.0,  # building
+    3: 1.0,  # wall
+    4: 1.0,  # fence
+    5: 1.0,  # pole
+    6: 1.0,  # traffic light
+    7: 1.0,  # traffic sign
+    8: 1.5,  # vegetation
+    9: 1.5,  # terrain
+    10: 1.5,  # sky
+    11: 0.5,  # person
+    12: 0.5,  # rider
+    13: 3.0,  # car
+    14: 3.0,  # truck
+    15: 3.0,  # bus
+    16: 0.0,  # train
+    17: 0.2,  # motorcycle
+    18: 0.5,  # bicycle
+}

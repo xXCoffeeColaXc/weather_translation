@@ -21,3 +21,38 @@ NOTES:
 
 
 - instead of random crop 512 use resize to kisebb oldal and then crop to maintain realistic point of view
+
+
+----------------------------------------------------
+
+fog: 
+frankfurt_000000_009688_leftImg8bit
+lindau_000004_000019_leftImg8bit
+lindau_000006_000019_leftImg8bit
+lindau_000056_000019_leftImg8bit
+munster_000001_000019_leftImg8bit
+munster_000004_000019_leftImg8bit
+munster_000025_000019_leftImg8bit
+munster_000050_000019_leftImg8bit
+
+night: 
+frankfurt_000000_002963_leftImg8bit
+frankfurt_000000_004617_leftImg8bit
+frankfurt_000000_009688_leftImg8bit
+lindau_000056_000019_leftImg8bit
+munster_000019_000019_leftImg8bit
+
+munster_000009_000019_leftImg8bit
+frankfurt_000000_013382_leftImg8bit
+lindau_000013_000019_leftImg8bit
+lindau_000047_000019_leftImg8bit
+
+rain:
+frankfurt_000000_002196_leftImg8bit
+frankfurt_000000_002963_leftImg8bit
+frankfurt_000000_009688_leftImg8bit
+frankfurt_000000_021879_leftImg8bit
+lindau_000004_000019_leftImg8bit
+lindau_000056_000019_leftImg8bit
+munster_000004_000019_leftImg8bit
+munster_000009_000019_leftImg8bit

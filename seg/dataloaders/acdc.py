@@ -25,7 +25,7 @@ IMAGE_REF_SUFFIX = "_rgb_ref_anon.png"
 GT_LABEL_SUFFIX = "_gt_labelIds.png"
 GT_TRAIN_SUFFIX = "_gt_labelTrainIds.png"
 
-DEFAULT_WEATHERS = ("fog", "night", "rain", "snow")
+DEFAULT_WEATHERS = ("fog", "night", "rain")
 
 
 def _list_weathers(weather: str | Iterable[str]) -> List[str]:

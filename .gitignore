@@ -15,8 +15,12 @@ data/*
 /eval
 /eval_kl
 /eval_teacher
+/eval_fog
+/eval_rain
+/eval_night
 /eval_city
 /gen_ddpm/checkpoints
 /gen_ddpm/ddpm_sgg_samples
+/gen_ddpm/ddpm_final_experiments
 /srgan_model/weights
 *.pt
