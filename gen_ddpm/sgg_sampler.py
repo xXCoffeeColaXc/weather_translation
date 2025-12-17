@@ -5,7 +5,6 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
-from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,6 +13,7 @@ from torchvision import transforms
 from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
+from PIL import Image
 
 from gen_ddpm.linear_noise_scheduler import LinearNoiseScheduler
 from gen.sgg_sampler import (
@@ -37,27 +37,37 @@ MEAN, STD = [0.4865, 0.4998, 0.4323], [0.2326, 0.2276, 0.2659]
 
 OUTDIR = "gen_ddpm/ddpm_final_experiments/benchmark_002"
 
-GUIDE_LAMBDA = 5.0
+input_paths = [
+    "frankfurt_000000_002963_leftImg8bit",
+    "frankfurt_000000_009688_leftImg8bit",
+    "frankfurt_000000_013382_leftImg8bit",
+    "lindau_000004_000019_leftImg8bit",
+    "lindau_000013_000019_leftImg8bit",
+    "lindau_000047_000019_leftImg8bit",
+    "munster_000009_000019_leftImg8bit",
+]
+
+GUIDE_LAMBDA = 10.0
 GUIDE_START = 0.0
 GUIDE_END = 1.0
 GUIDE_ALLOWED_CLASSES = [0, 1, 2, 8, 9, 10, 13, 14]
 GUIDE_CLASS_WEIGHTS = {
     13: 3.0,  # car
-    0: 2.0,  # road
-    2: 1.0,  # building
-    1: 1.0,  # sidewalk
+    0: 1.5,  # road
+    2: 1.5,  # building
+    1: 1.5,  # sidewalk
     8: 1.5,  # vegetation
     9: 1.0,  # terrain
     10: 1.0,  # sky
 }
 GUIDE_CLASS_WEIGHTS = None
-TEMPERATURE = 1.5
-LOSS_TYPE = "blend"
-BLEND_WEIGHT = 0.7
-PRED_ON_X0_HAT = True
-STEPS = 500
+TEMPERATURE = 1.0
+LOSS_TYPE = "ce"
+BLEND_WEIGHT = 0.1
+PRED_ON_X0_HAT = False
+STEPS = 400
 MODE = "alternate"
-GRAD_CLIP_NORM: Optional[float] = 5.0  # clip gradients by global norm if set
+GRAD_CLIP_NORM: Optional[float] = 1.5  # clip gradients by global norm if set
 GRAD_CLIP_VALUE: Optional[float] = None  # clamp elementwise if set
 GRAD_EPS = 1e-8
 
@@ -84,10 +94,10 @@ class StepOutput:
 class SamplerConfig:
     # data
     dataset_root: str = "data/cityscapes"  # "data/cityscapes"
-    split: str = "val"
+    split: str = "my_test"
     image_size: int = 128
     batch_size: int = 1
-    num_workers: int = 4
+    num_workers: int = 1
     max_samples: Optional[int] = 20
 
     # diffusion
@@ -238,17 +248,26 @@ def build_step_logger(steps_dir: Path) -> Callable[[StepOutput], None]:
     """Save decoded image/x0 and teacher masks for each logged step."""
     steps_dir.mkdir(parents=True, exist_ok=True)
 
+    @torch.inference_mode()
     def _callback(step: StepOutput) -> None:
         suffix = f"step_{step.step_index:03d}_t{step.timestep:04d}"
 
-        save_01(step.decoded_image, steps_dir / f"{suffix}_image.png")
-        save_01(step.decoded_x0_image, steps_dir / f"{suffix}_x0.png")
+        if step.decoded_image is not None:
+            save_01(step.decoded_image, steps_dir / f"{suffix}_image.png")
+        if step.decoded_x0_image is not None:
+            save_01(step.decoded_x0_image, steps_dir / f"{suffix}_x0.png")
 
-        mask_to_color(step.predicted_mask[0]).save(steps_dir / f"{suffix}_mask.png")
-        mask_to_color(step.predicted_mask_x0[0]).save(steps_dir / f"{suffix}_mask_x0.png")
+        if step.predicted_mask is not None:
+            mask_to_color(step.predicted_mask[0].cpu()).save(steps_dir / f"{suffix}_mask.png")
+        if step.predicted_mask_x0 is not None:
+            mask_to_color(step.predicted_mask_x0[0].cpu()).save(steps_dir / f"{suffix}_mask_x0.png")
 
-        save_01(step.predicted_without_guidance, steps_dir / f"{suffix}_image_wo_guidance.png")
-        mask_to_color(step.predicted_mask_without_guidance[0]).save(steps_dir / f"{suffix}_mask_wo_guidance.png")
+        if step.predicted_without_guidance is not None:
+            save_01(step.predicted_without_guidance, steps_dir / f"{suffix}_image_wo_guidance.png")
+        if step.predicted_mask_without_guidance is not None:
+            mask_to_color(step.predicted_mask_without_guidance[0].cpu()).save(
+                steps_dir / f"{suffix}_mask_wo_guidance.png"
+            )
 
         if step.guidance_heatmap is not None:
             save_01(step.guidance_heatmap, steps_dir / f"{suffix}_guidance_grad.png")
@@ -648,32 +667,33 @@ def reverse_denoise(
             should_log_step = idx == 0 or step == 0 or (log_every and step % log_every == 0)
             # Logging of teacher outputs (optional)
             if step_logger is not None and should_log_step:
-                sr_image = srgan(_denormalize_to_01(x))
-                logits = compute_teacher_logits(
-                    sr_image,
-                    teacher_bundle,
-                    target_size=sr_image.shape[-2:],
-                )
-                pred_mask = logits.argmax(dim=1)
+                with torch.inference_mode():
+                    sr_image = srgan(_denormalize_to_01(x))
+                    logits = compute_teacher_logits(
+                        sr_image,
+                        teacher_bundle,
+                        target_size=sr_image.shape[-2:],
+                    )
+                    pred_mask = logits.argmax(dim=1)
 
-                # x0_hat based on guided x_t and eps_guided
-                x0_hat = (x - sigma_t * eps_guided) / sqrt_alpha_bar
-                x0_image = srgan(_denormalize_to_01(x0_hat))
-                logits_x0 = compute_teacher_logits(
-                    x0_image,
-                    teacher_bundle,
-                    target_size=x0_image.shape[-2:],
-                )
-                pred_mask_x0 = logits_x0.argmax(dim=1)
+                    # x0_hat based on guided x_t and eps_guided
+                    x0_hat = (x - sigma_t * eps_guided) / sqrt_alpha_bar
+                    x0_image = srgan(_denormalize_to_01(x0_hat))
+                    logits_x0 = compute_teacher_logits(
+                        x0_image,
+                        teacher_bundle,
+                        target_size=x0_image.shape[-2:],
+                    )
+                    pred_mask_x0 = logits_x0.argmax(dim=1)
 
-                # Also run teacher on unguided x_t for comparison
-                sr_image_wo_guidance = srgan(_denormalize_to_01(x_wo_guidance))
-                logits = compute_teacher_logits(
-                    sr_image_wo_guidance,
-                    teacher_bundle,
-                    target_size=sr_image_wo_guidance.shape[-2:],
-                )
-                pred_mask_wo_guidance = logits.argmax(dim=1)
+                    # Also run teacher on unguided x_t for comparison
+                    sr_image_wo_guidance = srgan(_denormalize_to_01(x_wo_guidance))
+                    logits = compute_teacher_logits(
+                        sr_image_wo_guidance,
+                        teacher_bundle,
+                        target_size=sr_image_wo_guidance.shape[-2:],
+                    )
+                    pred_mask_wo_guidance = logits.argmax(dim=1)
 
                 step_logger(
                     StepOutput(
@@ -681,12 +701,12 @@ def reverse_denoise(
                         timestep=step,
                         progress=progress,
                         sgg_loss=float(loss.detach().cpu().item()) if loss is not None else None,
-                        decoded_image=sr_image,
-                        decoded_x0_image=x0_image,
-                        predicted_mask=pred_mask,
-                        predicted_mask_x0=pred_mask_x0,
-                        predicted_without_guidance=x_wo_guidance,
-                        predicted_mask_without_guidance=pred_mask_wo_guidance,
+                        decoded_image=sr_image.detach().cpu(),
+                        decoded_x0_image=x0_image.detach().cpu(),
+                        predicted_mask=pred_mask.detach().cpu(),
+                        predicted_mask_x0=pred_mask_x0.detach().cpu(),
+                        predicted_without_guidance=x_wo_guidance.detach().cpu(),
+                        predicted_mask_without_guidance=pred_mask_wo_guidance.detach().cpu(),
                     ))
 
             mean, sigma = scheduler.sample_prev_timestep2(x, eps_guided, t)
@@ -724,7 +744,7 @@ def run_pipeline(
     step_logger: Optional[Callable[[StepOutput], None]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Reference logits from original clean images for KL-type relative losses.
-    with torch.no_grad():
+    with torch.inference_mode():
         ref_sr = srgan(_denormalize_to_01(image_batch))
         ref_target = ref_sr.shape[-2:]
         reference_logits = compute_teacher_logits(
@@ -851,20 +871,29 @@ def main() -> None:
             len(dataset.samples) - 1,
             batch_idx * config.batch_size + rand_idx,
         )
-        sample_info = dataset.samples[dataset_idx]
+        #sample_info = dataset.samples[dataset_idx]
         # relative = Path(sample_info.image_path).relative_to(dataset.rgb_root).with_suffix("")
 
         # sample_dir = output_root / relative
         # sample_dir.mkdir(parents=True, exist_ok=True)
         # base_name = relative.stem
-        relative = sample_info.image_path.relative_to(dataset.left_dir)
+        #relative = sample_info.image_path.relative_to(dataset.left_dir)
 
-        sample_dir = output_root / relative.parent
+        sample_info = dataset.samples[batch_idx]
+        relative = sample_info.image_path.relative_to(dataset.left_dir)
+        output_path = output_root / relative
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not output_path.stem in input_paths:
+            continue
+
+        sample_dir = output_path
         sample_dir.mkdir(parents=True, exist_ok=True)
         base_name = relative.stem.replace("_leftImg8bit", "")
 
         step_logger = build_step_logger(sample_dir / "steps") if config.log_every else None
 
+        # Denoising with segmentation guidance requires gradients; surrounding IO remains inference-only.
         noised, denoised, denoised_wo_guidance = run_pipeline(
             model,
             scheduler,
@@ -890,11 +919,11 @@ def main() -> None:
             step_logger=step_logger,
         )
 
-        sr_original = srgan(_denormalize_to_01(image))
-        sr_denoised = srgan(_denormalize_to_01(denoised))
-        sr_denoised_wo_guidance = srgan(_denormalize_to_01(denoised_wo_guidance))
+        with torch.inference_mode():
+            sr_original = srgan(_denormalize_to_01(image))
+            sr_denoised = srgan(_denormalize_to_01(denoised))
+            sr_denoised_wo_guidance = srgan(_denormalize_to_01(denoised_wo_guidance))
 
-        with torch.no_grad():
             sr_pred_logits = compute_teacher_logits(
                 sr_denoised,
                 teacher_bundle,
